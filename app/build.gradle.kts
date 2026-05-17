@@ -13,7 +13,7 @@ android {
         minSdk = 30
         targetSdk = 35
         versionCode = 1
-        versionName = "1.0"
+        versionName = "1.0.0-CYBER"
     }
 
     buildTypes {
@@ -48,6 +48,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
     implementation("androidx.fragment:fragment-ktx:1.6.2")
     implementation("androidx.biometric:biometric:1.2.0-alpha05")
+    
     implementation(platform("androidx.compose:compose-bom:2024.05.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
@@ -55,6 +56,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.7.7")
+    
     implementation("io.coil-kt:coil-compose:2.6.0")
 
     val ktorVersion = "2.3.11"
@@ -63,6 +65,7 @@ dependencies {
     implementation("io.ktor:ktor-server-core:$ktorVersion")
     implementation("io.ktor:ktor-server-cio:$ktorVersion")
     implementation("io.ktor:ktor-server-websockets:$ktorVersion")
+    
     implementation("org.slf4j:slf4j-android:1.7.36")
     implementation("androidx.webkit:webkit:1.11.0")
 }

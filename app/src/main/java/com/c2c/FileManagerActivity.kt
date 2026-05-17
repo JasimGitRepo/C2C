@@ -22,10 +22,8 @@ import androidx.compose.ui.unit.sp
 import com.c2c.ui.theme.*
 import io.ktor.websocket.Frame
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
@@ -37,7 +35,7 @@ class FileManagerActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             AppTheme {
-                Surface(modifier = Modifier.fillMaxSize(), color = CyberBlack) {
+                Surface(modifier = Modifier.fillMaxSize().crtTerminalEffect(), color = CyberBlack) {
                     DualPaneFileManager()
                 }
             }
@@ -61,18 +59,24 @@ fun DualPaneFileManager() {
 
     LaunchedEffect(localPath, showHidden) {
         withContext(Dispatchers.IO) {
-            val dir = File(localPath)
-            if (dir.exists() && dir.isDirectory) {
-                val list = dir.listFiles()?.map { FsItem(it.name, it.absolutePath, it.isDirectory, it.length(), it.lastModified()) } ?: emptyList()
-                localFiles = list.filter { showHidden || !it.name.startsWith(".") }.sortedWith(compareBy({ !it.isDir }, { it.name.lowercase() }))
+            try {
+                val dir = File(localPath)
+                if (dir.exists() && dir.isDirectory) {
+                    val list = dir.listFiles()?.map { FsItem(it.name, it.absolutePath, it.isDirectory, it.length(), it.lastModified()) } ?: emptyList()
+                    localFiles = list.filter { showHidden || !it.name.startsWith(".") }.sortedWith(compareBy({ !it.isDir }, { it.name.lowercase() }))
+                }
+            } catch (e: Exception) {
+                ServerCore.log("FS ERROR: ${e.message}", false)
             }
         }
     }
 
     LaunchedEffect(remotePath, showHidden) {
-        if (ServerCore.liveSession?.isActive == true) {
+        if (ServerCore.liveSessions.isNotEmpty()) {
             scope.launch(Dispatchers.IO) {
-                ServerCore.liveSession?.send(Frame.Text("""{"cmd":"fs_list","arg":"$remotePath"}"""))
+                ServerCore.liveSessions.forEach { 
+                    it.send(Frame.Text("""{"cmd":"fs_list","arg":"$remotePath"}"""))
+                }
             }
         }
     }
@@ -89,7 +93,9 @@ fun DualPaneFileManager() {
                         list.add(FsItem(obj.getString("name"), obj.getString("path"), obj.getBoolean("isDir"), obj.optLong("size", 0), obj.optLong("modified", 0)))
                     }
                     remoteFiles = list.filter { showHidden || !it.name.startsWith(".") }.sortedWith(compareBy({ !it.isDir }, { it.name.lowercase() }))
-                } catch (e: Exception) {}
+                } catch (e: Exception) {
+                    ServerCore.log("FS PARSE ERROR: ${e.message}", false)
+                }
             }
         }
     }
@@ -97,7 +103,7 @@ fun DualPaneFileManager() {
     if (showTransfers) {
         AlertDialog(
             onDismissRequest = { showTransfers = false },
-            title = { Text("Active Transfers", fontFamily = CyberFont, color = CyberNeonCyan) },
+            title = { Text("[ ACTIVE TRANSFERS ]", fontFamily = CyberFont, color = CyberNeonCyan) },
             containerColor = CyberDarkGray,
             text = {
                 LazyColumn {
@@ -116,7 +122,7 @@ fun DualPaneFileManager() {
 
     Column(modifier = Modifier.fillMaxSize()) {
         TopAppBar(
-            title = { Text("C2C FILE PROTOCOL", fontFamily = CyberFont, color = CyberBlack) },
+            title = { Text("C2C_PROTOCOL_FS", fontFamily = CyberFont, color = CyberBlack) },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = CyberNeonCyan),
             actions = {
                 var menuExpanded by remember { mutableStateOf(false) }
@@ -124,15 +130,14 @@ fun DualPaneFileManager() {
                 Box {
                     IconButton(onClick = { menuExpanded = true }) { Icon(Icons.Default.MoreVert, "Menu", tint = CyberBlack) }
                     DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }, modifier = Modifier.background(CyberDarkGray)) {
-                        DropdownMenuItem(text = { Text(if (showHidden) "Hide Dotted Files" else "Show Dotted Files", color = CyberWhite, fontFamily = CyberFont) }, onClick = { showHidden = !showHidden; menuExpanded = false })
-                        DropdownMenuItem(text = { Text("Download via URL", color = CyberNeonYellow, fontFamily = CyberFont) }, onClick = { menuExpanded = false })
+                        DropdownMenuItem(text = { Text(if (showHidden) "Hide Dotted" else "Show Dotted", color = CyberWhite, fontFamily = CyberFont) }, onClick = { showHidden = !showHidden; menuExpanded = false })
                     }
                 }
             }
         )
 
         Column(modifier = Modifier.weight(1f).padding(8.dp)) {
-            Card(modifier = Modifier.weight(1f).fillMaxWidth().border(1.dp, CyberNeonYellow, MaterialTheme.shapes.small), colors = CardDefaults.cardColors(containerColor = CyberDarkGray)) {
+            Card(modifier = Modifier.weight(1f).fillMaxWidth().border(1.dp, CyberNeonYellow, CyberShapes.small), colors = CardDefaults.cardColors(containerColor = CyberDarkGray)) {
                 Column {
                     Row(modifier = Modifier.fillMaxWidth().background(CyberBlack).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = { val parent = File(localPath).parent; if (parent != null) localPath = parent }, modifier = Modifier.size(24.dp)) { Icon(Icons.Default.ArrowUpward, "Up", tint = CyberNeonYellow) }
@@ -145,7 +150,7 @@ fun DualPaneFileManager() {
                 }
             }
             Spacer(modifier = Modifier.height(8.dp))
-            Card(modifier = Modifier.weight(1f).fillMaxWidth().border(1.dp, CyberNeonPink, MaterialTheme.shapes.small), colors = CardDefaults.cardColors(containerColor = CyberDarkGray)) {
+            Card(modifier = Modifier.weight(1f).fillMaxWidth().border(1.dp, CyberNeonPink, CyberShapes.small), colors = CardDefaults.cardColors(containerColor = CyberDarkGray)) {
                 Column {
                     Row(modifier = Modifier.fillMaxWidth().background(CyberBlack).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = { val segments = remotePath.trimEnd('/').split("/"); if (segments.size > 1) remotePath = segments.dropLast(1).joinToString("/") + "/" }, modifier = Modifier.size(24.dp)) { Icon(Icons.Default.ArrowUpward, "Up", tint = CyberNeonPink) }
@@ -153,7 +158,7 @@ fun DualPaneFileManager() {
                         Text("REMOTE: $remotePath", color = CyberNeonPink, fontFamily = CyberFont, fontSize = 10.sp, maxLines = 1)
                     }
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        if (ServerCore.liveSession?.isActive != true) item { Text("CLIENT DISCONNECTED", color = LogMediumRed, fontFamily = CyberFont, modifier = Modifier.padding(16.dp)) }
+                        if (ServerCore.liveSessions.isEmpty()) item { Text("CLIENT DISCONNECTED", color = LogMediumRed, fontFamily = CyberFont, modifier = Modifier.padding(16.dp)) }
                         else items(remoteFiles) { file -> FileRow(file, CyberNeonPink) { if (file.isDir) remotePath = file.path } }
                     }
                 }
