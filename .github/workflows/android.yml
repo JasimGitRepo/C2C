@@ -14,6 +14,66 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # =========================================================
+      # --- NEW TDLIB COMPILATION TASKS (INJECTED) ---
+      # =========================================================
+
+      - name: Set up Swap Space (Crucial for TDLib compilation)
+        run: |
+          # TDLib compilation requires ~16GB RAM. GitHub runners have 7GB. 
+          # We add 10GB of Swap space to prevent the compiler from crashing (Signal 9/Killed).
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install TDLib Build Dependencies
+        run: |
+          # PHP and Gperf are required by TDLib to dynamically generate the TdApi.java file
+          sudo apt-get update
+          sudo apt-get install -y make git zlib1g-dev libssl-dev gperf php-cli cmake clang libc++-dev libc++abi-dev
+
+      - name: Download and Compile TDLib (arm64-v8a)
+        run: |
+          git clone https://github.com/tdlib/td.git
+          cd td
+          
+          mkdir build-arm64
+          cd build-arm64
+          
+          # Use the Android NDK pre-installed on GitHub Actions Ubuntu runners.
+          # Note: We build for 'arm64-v8a' to save CI time. This covers all modern physical Android phones.
+          # If you ever want to run this on a PC Android Studio Emulator, you would duplicate this block and change it to 'x86_64'.
+          cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+                -DANDROID_ABI=arm64-v8a \
+                -DANDROID_PLATFORM=android-30 \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DTD_ENABLE_JNI=ON \
+                ..
+                
+          # Compile the JNI Library (This step will take approx 15 - 25 minutes)
+          cmake --build . --target tdjni -- -j$(nproc)
+
+      - name: Inject Compiled TDLib into Android Project
+        run: |
+          # 1. Place the compiled C++ library (.so) into the project's jniLibs folder
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp td/build-arm64/libtdjni.so app/src/main/jniLibs/arm64-v8a/
+          
+          # 2. Extract both the static Client.java and the dynamically generated TdApi.java 
+          # and inject them directly into our app's source tree.
+          mkdir -p app/src/main/java/org/drinkless/tdlib
+          find td -name "*.java" | grep "org/drinkless/tdlib" | xargs -I {} cp {} app/src/main/java/org/drinkless/tdlib/
+          
+          # 3. Remove the placeholder Maven dependency from build.gradle.kts because 
+          # we are now compiling the source and libraries locally.
+          sed -i 's/implementation("org.drinkless.tdlib:tdlib:1.8.0")//g' app/build.gradle.kts
+
+      # =========================================================
+      # --- END OF TDLIB TASKS ---
+      # =========================================================
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:

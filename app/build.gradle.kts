@@ -14,6 +14,15 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0-CYBER"
+        ndk {
+             abiFilters.add("arm64-v8a")
+        }
+    }
+    
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDirs("src/main/jniLibs")
+        }
     }
 
     buildTypes {
@@ -68,4 +77,6 @@ dependencies {
     
     implementation("org.slf4j:slf4j-android:1.7.36")
     implementation("androidx.webkit:webkit:1.11.0")
+    
+    implementation("org.drinkless.tdlib:tdlib:1.8.0")
 }
