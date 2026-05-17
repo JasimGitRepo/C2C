@@ -24,10 +24,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: td-prebuilt
-          key: tdlib-arm64-v1
+          key: tdlib-arm64-v2
 
-      # 2. Use '/swapfile2' to avoid clashing with the OS's locked default swapfile
-      - name: Set up Swap Space (Fix for busy file)
+      # 2. Setup Swap Space using /swapfile2 to avoid OS filesystem locks
+      - name: Set up Swap Space
         if: steps.cache-tdlib.outputs.cache-hit != 'true'
         run: |
           sudo dd if=/dev/zero of=/swapfile2 bs=1M count=10240
@@ -42,7 +42,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make git zlib1g-dev libssl-dev gperf php-cli cmake clang libc++-dev libc++abi-dev
 
-      # 3. Compile and extract ONLY what we need so we can cache it cleanly
+      # 3. Cross-Compile OpenSSL for Android Statically (Fixes the missing Crypto error)
+      - name: Build OpenSSL for Android (Static)
+        if: steps.cache-tdlib.outputs.cache-hit != 'true'
+        run: |
+          export ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME
+          export PATH=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+          
+          wget https://github.com/openssl/openssl/releases/download/openssl-3.1.5/openssl-3.1.5.tar.gz
+          tar -xzf openssl-3.1.5.tar.gz
+          cd openssl-3.1.5
+          
+          # 'no-shared' ensures OpenSSL compiles statically so it can be absorbed into libtdjni.so
+          ./Configure android-arm64 no-shared -D__ANDROID_API__=30 --prefix=$GITHUB_WORKSPACE/openssl-prebuilt
+          make -j$(nproc)
+          make install_sw
+
+      # 4. Compile TDLib using the statically built OpenSSL
       - name: Download and Compile TDLib
         if: steps.cache-tdlib.outputs.cache-hit != 'true'
         run: |
@@ -50,10 +66,13 @@ jobs:
           cd td
           mkdir build-arm64
           cd build-arm64
+          
           cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
                 -DANDROID_ABI=arm64-v8a \
                 -DANDROID_PLATFORM=android-30 \
                 -DCMAKE_BUILD_TYPE=Release \
+                -DOPENSSL_ROOT_DIR=$GITHUB_WORKSPACE/openssl-prebuilt \
+                -DOPENSSL_USE_STATIC_LIBS=TRUE \
                 -DTD_ENABLE_JNI=ON \
                 ..
           
@@ -65,17 +84,17 @@ jobs:
           mkdir -p td-prebuilt/libs
           mkdir -p td-prebuilt/java/org/drinkless/tdlib
           
-          cp td/build-arm64/libtdjni.so td-prebuilt/libs/
+          find td/build-arm64 -name "libtdjni.so" -exec cp {} td-prebuilt/libs/ \;
           find td -name "*.java" | grep "org/drinkless/tdlib" | xargs -I {} cp {} td-prebuilt/java/org/drinkless/tdlib/
 
-      # 4. Inject the compiled/cached files into your Android Project tree
+      # 5. Inject the compiled/cached files into your Android Project tree
       - name: Inject Compiled TDLib into Android Project
         run: |
           # Copy the .so C++ library
           mkdir -p app/src/main/jniLibs/arm64-v8a
           cp td-prebuilt/libs/libtdjni.so app/src/main/jniLibs/arm64-v8a/
           
-          # Copy the generated TdApi.java files
+          # Copy the generated TdApi.java and Client.java files
           mkdir -p app/src/main/java/org/drinkless/tdlib
           cp td-prebuilt/java/org/drinkless/tdlib/*.java app/src/main/java/org/drinkless/tdlib/
           
