@@ -26,14 +26,14 @@ jobs:
           path: td-prebuilt
           key: tdlib-arm64-v1
 
-      # 2. Use 'dd' instead of 'fallocate' to bypass GitHub Actions filesystem limits
-      - name: Set up Swap Space (Fix for fallocate)
+      # 2. Use '/swapfile2' to avoid clashing with the OS's locked default swapfile
+      - name: Set up Swap Space (Fix for busy file)
         if: steps.cache-tdlib.outputs.cache-hit != 'true'
         run: |
-          sudo dd if=/dev/zero of=/swapfile bs=1M count=10240
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo dd if=/dev/zero of=/swapfile2 bs=1M count=10240
+          sudo chmod 600 /swapfile2
+          sudo mkswap /swapfile2
+          sudo swapon /swapfile2
           free -h
 
       - name: Install TDLib Build Dependencies
