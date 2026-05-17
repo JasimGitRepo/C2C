@@ -147,12 +147,3 @@ fun FileRow(file: FsItem, tint: Color, onClick: () -> Unit) {
         }
     }
 }
-
-@Composable
-fun GlassCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
-    Card(
-        modifier = modifier.border(1.dp, GlassBorder, PremiumShapes.medium),
-        colors = CardDefaults.cardColors(containerColor = GlassSurface),
-        shape = PremiumShapes.medium
-    ) { content() }
-}
