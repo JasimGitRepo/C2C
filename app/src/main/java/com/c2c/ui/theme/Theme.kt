@@ -14,8 +14,15 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
+import com.c2c.R
+
+val CyberFont = FontFamily(Font(R.font.jetbrains_mono, FontWeight.Normal))
+val UbuntuFont = FontFamily(Font(R.font.ubuntu_regular, FontWeight.Normal))
 
 private val PremiumColorScheme = darkColorScheme(
     primary = ActionBlue,
@@ -49,43 +56,16 @@ fun AnimatedMeshBackground() {
         val height = size.height
         val radius = width * 0.8f
 
-        // Purple Blob
         drawCircle(
-            brush = Brush.radialGradient(
-                colors = listOf(PremiumPurple.copy(alpha = 0.4f), Color.Transparent),
-                radius = radius
-            ),
+            brush = Brush.radialGradient(listOf(PremiumPurple.copy(alpha = 0.4f), Color.Transparent), radius = radius),
             radius = radius,
-            center = Offset(
-                x = width / 2 + (Math.cos(Math.toRadians(angle.toDouble())).toFloat() * width / 3),
-                y = height / 3 + (Math.sin(Math.toRadians(angle.toDouble())).toFloat() * height / 4)
-            )
+            center = Offset(width / 2 + (Math.cos(Math.toRadians(angle.toDouble())).toFloat() * width / 3), height / 3 + (Math.sin(Math.toRadians(angle.toDouble())).toFloat() * height / 4))
         )
 
-        // Teal Blob
         drawCircle(
-            brush = Brush.radialGradient(
-                colors = listOf(PremiumTeal.copy(alpha = 0.3f), Color.Transparent),
-                radius = radius
-            ),
+            brush = Brush.radialGradient(listOf(PremiumTeal.copy(alpha = 0.3f), Color.Transparent), radius = radius),
             radius = radius,
-            center = Offset(
-                x = width / 2 + (Math.cos(Math.toRadians((angle + 120).toDouble())).toFloat() * width / 3),
-                y = height / 1.5f + (Math.sin(Math.toRadians((angle + 120).toDouble())).toFloat() * height / 4)
-            )
-        )
-
-        // Rose Blob
-        drawCircle(
-            brush = Brush.radialGradient(
-                colors = listOf(PremiumRose.copy(alpha = 0.25f), Color.Transparent),
-                radius = radius
-            ),
-            radius = radius,
-            center = Offset(
-                x = width / 2 + (Math.cos(Math.toRadians((angle + 240).toDouble())).toFloat() * width / 3),
-                y = height / 2 + (Math.sin(Math.toRadians((angle + 240).toDouble())).toFloat() * height / 4)
-            )
+            center = Offset(width / 2 + (Math.cos(Math.toRadians((angle + 120).toDouble())).toFloat() * width / 3), height / 1.5f + (Math.sin(Math.toRadians((angle + 120).toDouble())).toFloat() * height / 4))
         )
     }
 }
@@ -105,7 +85,7 @@ fun PremiumTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = PremiumColorScheme,
         shapes = PremiumShapes,
-        typography = Typography(), // Using elegant system default sans-serif
+        typography = Typography(),
         content = {
             Box(modifier = Modifier.fillMaxSize()) {
                 AnimatedMeshBackground()
