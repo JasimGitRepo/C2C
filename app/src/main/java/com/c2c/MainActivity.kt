@@ -1,4 +1,3 @@
---- START OF FILE app/src/main/java/com/c2c/MainActivity.kt ---
 package com.c2c
 
 import android.Manifest
