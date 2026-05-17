@@ -11,7 +11,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -34,8 +34,8 @@ class FileManagerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            AppTheme {
-                Surface(modifier = Modifier.fillMaxSize().crtTerminalEffect(), color = CyberBlack) {
+            PremiumTheme {
+                Surface(modifier = Modifier.fillMaxSize(), color = Color.Transparent) {
                     DualPaneFileManager()
                 }
             }
@@ -54,8 +54,6 @@ fun DualPaneFileManager() {
     var remoteFiles by remember { mutableStateOf<List<FsItem>>(emptyList()) }
 
     var showHidden by remember { mutableStateOf(false) }
-    var showTransfers by remember { mutableStateOf(false) }
-    var transfers = remember { mutableStateListOf<TransferJob>() }
 
     LaunchedEffect(localPath, showHidden) {
         withContext(Dispatchers.IO) {
@@ -65,18 +63,14 @@ fun DualPaneFileManager() {
                     val list = dir.listFiles()?.map { FsItem(it.name, it.absolutePath, it.isDirectory, it.length(), it.lastModified()) } ?: emptyList()
                     localFiles = list.filter { showHidden || !it.name.startsWith(".") }.sortedWith(compareBy({ !it.isDir }, { it.name.lowercase() }))
                 }
-            } catch (e: Exception) {
-                ServerCore.log("FS ERROR: ${e.message}", false)
-            }
+            } catch (e: Exception) { ServerCore.log("FS ERROR: ${e.message}", false) }
         }
     }
 
     LaunchedEffect(remotePath, showHidden) {
         if (ServerCore.liveSessions.isNotEmpty()) {
             scope.launch(Dispatchers.IO) {
-                ServerCore.liveSessions.forEach { 
-                    it.send(Frame.Text("""{"cmd":"fs_list","arg":"$remotePath"}"""))
-                }
+                ServerCore.liveSessions.forEach { it.send(Frame.Text("""{"cmd":"fs_list","arg":"$remotePath"}""")) }
             }
         }
     }
@@ -93,73 +87,46 @@ fun DualPaneFileManager() {
                         list.add(FsItem(obj.getString("name"), obj.getString("path"), obj.getBoolean("isDir"), obj.optLong("size", 0), obj.optLong("modified", 0)))
                     }
                     remoteFiles = list.filter { showHidden || !it.name.startsWith(".") }.sortedWith(compareBy({ !it.isDir }, { it.name.lowercase() }))
-                } catch (e: Exception) {
-                    ServerCore.log("FS PARSE ERROR: ${e.message}", false)
-                }
+                } catch (e: Exception) {}
             }
         }
     }
 
-    if (showTransfers) {
-        AlertDialog(
-            onDismissRequest = { showTransfers = false },
-            title = { Text("[ ACTIVE TRANSFERS ]", fontFamily = CyberFont, color = CyberNeonCyan) },
-            containerColor = CyberDarkGray,
-            text = {
-                LazyColumn {
-                    items(transfers) { job ->
-                        Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                            Text("${if (job.isUpload) "UP" else "DOWN"}: ${job.fileName}", color = CyberWhite, fontFamily = UbuntuInputFont, fontSize = 12.sp)
-                            LinearProgressIndicator(progress = { job.progress }, modifier = Modifier.fillMaxWidth().height(4.dp), color = CyberNeonPink)
-                        }
-                    }
-                    if (transfers.isEmpty()) item { Text("No active transfers.", color = Color.Gray, fontFamily = CyberFont) }
-                }
-            },
-            confirmButton = { TextButton(onClick = { showTransfers = false }) { Text("CLOSE", color = CyberNeonCyan, fontFamily = CyberFont) } }
-        )
-    }
-
     Column(modifier = Modifier.fillMaxSize()) {
         TopAppBar(
-            title = { Text("C2C_PROTOCOL_FS", fontFamily = CyberFont, color = CyberBlack) },
-            colors = TopAppBarDefaults.topAppBarColors(containerColor = CyberNeonCyan),
+            title = { Text("System File Explorer", color = TextPrimary) },
+            colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
             actions = {
-                var menuExpanded by remember { mutableStateOf(false) }
-                IconButton(onClick = { showTransfers = true }) { Icon(Icons.Default.SwapVert, "Transfers", tint = CyberBlack) }
-                Box {
-                    IconButton(onClick = { menuExpanded = true }) { Icon(Icons.Default.MoreVert, "Menu", tint = CyberBlack) }
-                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }, modifier = Modifier.background(CyberDarkGray)) {
-                        DropdownMenuItem(text = { Text(if (showHidden) "Hide Dotted" else "Show Dotted", color = CyberWhite, fontFamily = CyberFont) }, onClick = { showHidden = !showHidden; menuExpanded = false })
-                    }
+                IconButton(onClick = { showHidden = !showHidden }) { 
+                    Icon(if (showHidden) Icons.Rounded.Visibility else Icons.Rounded.VisibilityOff, null, tint = TextPrimary) 
                 }
             }
         )
 
-        Column(modifier = Modifier.weight(1f).padding(8.dp)) {
-            Card(modifier = Modifier.weight(1f).fillMaxWidth().border(1.dp, CyberNeonYellow, CyberShapes.small), colors = CardDefaults.cardColors(containerColor = CyberDarkGray)) {
+        Column(modifier = Modifier.weight(1f).padding(horizontal = 16.dp, vertical = 8.dp)) {
+            GlassCard(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 Column {
-                    Row(modifier = Modifier.fillMaxWidth().background(CyberBlack).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { val parent = File(localPath).parent; if (parent != null) localPath = parent }, modifier = Modifier.size(24.dp)) { Icon(Icons.Default.ArrowUpward, "Up", tint = CyberNeonYellow) }
+                    Row(modifier = Modifier.fillMaxWidth().background(Color(0x22000000)).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = { val parent = File(localPath).parent; if (parent != null) localPath = parent }, modifier = Modifier.size(28.dp)) { Icon(Icons.Rounded.ArrowUpward, null, tint = ActionBlue) }
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("LOCAL: $localPath", color = CyberNeonYellow, fontFamily = CyberFont, fontSize = 10.sp, maxLines = 1)
+                        Text("LOCAL: $localPath", color = ActionBlue, fontSize = 11.sp, maxLines = 1)
                     }
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        items(localFiles) { file -> FileRow(file, CyberNeonYellow) { if (file.isDir) localPath = file.path } }
+                        items(localFiles) { file -> FileRow(file, ActionBlue) { if (file.isDir) localPath = file.path } }
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(8.dp))
-            Card(modifier = Modifier.weight(1f).fillMaxWidth().border(1.dp, CyberNeonPink, CyberShapes.small), colors = CardDefaults.cardColors(containerColor = CyberDarkGray)) {
+            Spacer(modifier = Modifier.height(16.dp))
+            GlassCard(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 Column {
-                    Row(modifier = Modifier.fillMaxWidth().background(CyberBlack).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { val segments = remotePath.trimEnd('/').split("/"); if (segments.size > 1) remotePath = segments.dropLast(1).joinToString("/") + "/" }, modifier = Modifier.size(24.dp)) { Icon(Icons.Default.ArrowUpward, "Up", tint = CyberNeonPink) }
+                    Row(modifier = Modifier.fillMaxWidth().background(Color(0x22000000)).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = { val segments = remotePath.trimEnd('/').split("/"); if (segments.size > 1) remotePath = segments.dropLast(1).joinToString("/") + "/" }, modifier = Modifier.size(28.dp)) { Icon(Icons.Rounded.ArrowUpward, null, tint = PremiumTeal) }
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("REMOTE: $remotePath", color = CyberNeonPink, fontFamily = CyberFont, fontSize = 10.sp, maxLines = 1)
+                        Text("REMOTE: $remotePath", color = PremiumTeal, fontSize = 11.sp, maxLines = 1)
                     }
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        if (ServerCore.liveSessions.isEmpty()) item { Text("CLIENT DISCONNECTED", color = LogMediumRed, fontFamily = CyberFont, modifier = Modifier.padding(16.dp)) }
-                        else items(remoteFiles) { file -> FileRow(file, CyberNeonPink) { if (file.isDir) remotePath = file.path } }
+                        if (ServerCore.liveSessions.isEmpty()) item { Text("Connection Offline", color = TextSecondary, modifier = Modifier.padding(16.dp)) }
+                        else items(remoteFiles) { file -> FileRow(file, PremiumTeal) { if (file.isDir) remotePath = file.path } }
                     }
                 }
             }
@@ -169,14 +136,23 @@ fun DualPaneFileManager() {
 
 @Composable
 fun FileRow(file: FsItem, tint: Color, onClick: () -> Unit) {
-    Row(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-        Icon(if (file.isDir) Icons.Default.Folder else Icons.Default.InsertDriveFile, contentDescription = null, tint = tint, modifier = Modifier.size(24.dp))
-        Spacer(modifier = Modifier.width(8.dp))
+    Row(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(if (file.isDir) Icons.Rounded.Folder else Icons.Rounded.InsertDriveFile, contentDescription = null, tint = tint, modifier = Modifier.size(24.dp))
+        Spacer(modifier = Modifier.width(12.dp))
         Column {
-            Text(file.name, color = CyberWhite, fontFamily = UbuntuInputFont, fontSize = 14.sp)
+            Text(file.name, color = TextPrimary, fontSize = 14.sp)
             if (!file.isDir) {
-                Text("${file.size / 1024} KB", color = Color.Gray, fontFamily = CyberFont, fontSize = 10.sp)
+                Text("${file.size / 1024} KB", color = TextSecondary, fontSize = 11.sp)
             }
         }
     }
+}
+
+@Composable
+fun GlassCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    Card(
+        modifier = modifier.border(1.dp, GlassBorder, PremiumShapes.medium),
+        colors = CardDefaults.cardColors(containerColor = GlassSurface),
+        shape = PremiumShapes.medium
+    ) { content() }
 }
