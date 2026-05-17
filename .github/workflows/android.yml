@@ -15,18 +15,25 @@ jobs:
         uses: actions/checkout@v4
 
       # =========================================================
+      # 1. MOVED TO TOP: CMake MUST have Java to generate 'tdjni'
+      # =========================================================
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # =========================================================
       # --- TDLIB COMPILATION & CACHING ENGINE ---
       # =========================================================
 
-      # 1. Check if we already compiled TDLib in a previous run
       - name: Cache TDLib Build
         id: cache-tdlib
         uses: actions/cache@v4
         with:
           path: td-prebuilt
-          key: tdlib-arm64-v3
+          key: tdlib-arm64-v4
 
-      # 2. Setup Swap Space using /swapfile2 to avoid OS filesystem locks
       - name: Set up Swap Space
         if: steps.cache-tdlib.outputs.cache-hit != 'true'
         run: |
@@ -42,7 +49,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make git zlib1g-dev libssl-dev gperf php-cli cmake clang libc++-dev libc++abi-dev
 
-      # 3. Cross-Compile OpenSSL for Android Statically
       - name: Build OpenSSL for Android (Static)
         if: steps.cache-tdlib.outputs.cache-hit != 'true'
         run: |
@@ -53,22 +59,31 @@ jobs:
           tar -xzf openssl-3.1.5.tar.gz
           cd openssl-3.1.5
           
-          # '-fPIC' ensures position independent code, required for shared Android libs
-          # '--libdir=lib' ensures outputs go exactly to /lib/ instead of /lib64/
           ./Configure android-arm64 no-shared -fPIC -D__ANDROID_API__=30 --prefix=$GITHUB_WORKSPACE/openssl-prebuilt --libdir=lib
           make -j$(nproc)
           make install_sw
 
-      # 4. Compile TDLib and force-feed the OpenSSL paths directly to CMake
       - name: Download and Compile TDLib
         if: steps.cache-tdlib.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/tdlib/td.git
           cd td
+          
+          # ---------------------------------------------------------
+          # FIX: Compile Host Tools First (Required for cross-compiling)
+          # ---------------------------------------------------------
+          mkdir build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake --build . --target prepare_cross_compiling
+          cd ..
+          
+          # ---------------------------------------------------------
+          # Build Android Target (Now it knows how to make tdjni)
+          # ---------------------------------------------------------
           mkdir build-arm64
           cd build-arm64
           
-          # By directly defining OPENSSL_CRYPTO_LIBRARY, we bypass CMake's restricted search path
           cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
                 -DANDROID_ABI=arm64-v8a \
                 -DANDROID_PLATFORM=android-30 \
@@ -82,7 +97,7 @@ jobs:
           # Compile the JNI Library
           cmake --build . --target tdjni -- -j$(nproc)
           
-          # Move the compiled files into a clean directory for caching
+          # Extract the compiled files for caching and Android injection
           cd ../..
           mkdir -p td-prebuilt/libs
           mkdir -p td-prebuilt/java/org/drinkless/tdlib
@@ -90,36 +105,26 @@ jobs:
           find td/build-arm64 -name "libtdjni.so" -exec cp {} td-prebuilt/libs/ \;
           find td -name "*.java" | grep "org/drinkless/tdlib" | xargs -I {} cp {} td-prebuilt/java/org/drinkless/tdlib/
 
-      # 5. Inject the compiled/cached files into your Android Project tree
+      # =========================================================
+      # --- INJECT INTO ANDROID & BUILD APK ---
+      # =========================================================
+
       - name: Inject Compiled TDLib into Android Project
         run: |
-          # Copy the .so C++ library
           mkdir -p app/src/main/jniLibs/arm64-v8a
           cp td-prebuilt/libs/libtdjni.so app/src/main/jniLibs/arm64-v8a/
           
-          # Copy the generated TdApi.java and Client.java files
           mkdir -p app/src/main/java/org/drinkless/tdlib
           cp td-prebuilt/java/org/drinkless/tdlib/*.java app/src/main/java/org/drinkless/tdlib/
           
-          # Strip out the fake maven dependency so Gradle doesn't crash looking for it
           sed -i 's/implementation("org.drinkless.tdlib:tdlib:1.8.0")//g' app/build.gradle.kts
-
-      # =========================================================
-      # --- STANDARD ANDROID BUILD STEPS ---
-      # =========================================================
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
 
       - name: Install & Setup Gradle Globally
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.7' 
 
-      - name: Build Debug APK with System Gradle
+      - name: Build Debug APK
         run: gradle assembleDebug
 
       - name: Upload APK
