@@ -1,3 +1,4 @@
+--- START OF FILE app/src/main/java/com/c2c/MainActivity.kt ---
 package com.c2c
 
 import android.Manifest
@@ -25,7 +26,6 @@ import android.os.IBinder
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.BorderStroke
@@ -86,25 +86,21 @@ import androidx.navigation.compose.*
 import com.c2c.ui.theme.*
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
-import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
-import io.ktor.client.statement.bodyAsText
 import io.ktor.server.application.*
 import io.ktor.server.engine.ApplicationEngine
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.routing.routing
 import io.ktor.server.websocket.*
 import io.ktor.websocket.*
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 import org.json.JSONArray
@@ -183,6 +179,9 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     var serverLogs = mutableStateListOf<String>()
     var latestSlabTxt by mutableStateOf(ServerCore.lastStatusSlab)
     
+    // TDLib Diagnostics Engine
+    var tdLogs = mutableStateListOf<String>()
+    
     // Persistent Local Chat Engine
     var tgMessages = mutableStateListOf<TgMessage>()
     var tgChatName by mutableStateOf("Target Node")
@@ -212,22 +211,56 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) { for (chunk in audioChannel) { ServerCore.liveSessions.forEach { try { it.send(Frame.Binary(true, chunk)) } catch (e: Exception) {} } } }
     }
 
-    // --- TDLib Engine ---
+    // --- Core Logging Engine ---
+    fun tdLog(msg: String, type: String = "INFO") {
+        val time = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
+        viewModelScope.launch(Dispatchers.Main) {
+            if (tdLogs.size > 1000) tdLogs.removeAt(0)
+            tdLogs.add("[$time] [$type] $msg")
+        }
+    }
+
+    fun dumpTdLogs(context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val file = File(dir, "TDLib_Diagnostic_Log_${System.currentTimeMillis()}.txt")
+                file.writeText(tdLogs.joinToString("\n"))
+                withContext(Dispatchers.Main) { Toast.makeText(context, "Logs dumped to Downloads folder!", Toast.LENGTH_LONG).show() }
+            } catch (e: Exception) { tdLog("Dump Failed: ${e.message}", "ERROR") }
+        }
+    }
+
+    // --- TDLib API Wrapper (Intercepts Errors) ---
+    private fun sendTd(query: TdApi.Function<*>, onResult: ((TdApi.Object) -> Unit)? = null) {
+        try {
+            tdClient?.send(query) { res ->
+                if (res is TdApi.Error) {
+                    tdLog("${query.javaClass.simpleName} Failed: [${res.code}] ${res.message}", "ERROR")
+                } else {
+                    onResult?.invoke(res)
+                }
+            }
+        } catch (e: Exception) {
+            tdLog("Exception executing ${query.javaClass.simpleName}: ${e.message}", "ERROR")
+        }
+    }
+
+    // --- TDLib Engine Lifecycle ---
     fun toggleTdLib() {
         if (isTdLibEngineRunning) {
-            tdClient?.send(TdApi.Close()) { tdAuthState = TdAuthState.CLOSED; isTdLibEngineRunning = false }
+            tdLog("Initiating Engine Shutdown...", "INFO")
+            sendTd(TdApi.Close()) { tdAuthState = TdAuthState.CLOSED; isTdLibEngineRunning = false; tdLog("Engine Offline", "SUCCESS") }
             tdClient = null
         } else {
+            tdLog("Igniting TDLib Core Engine...", "INFO")
             isTdLibEngineRunning = true
             tdAuthState = TdAuthState.INIT
             tgMessages.clear()
             
-            // FIXED: Using .apply for robust constructor
-            val verbosity = TdApi.SetLogVerbosityLevel().apply { newVerbosityLevel = 0 }
-            Client.execute(verbosity)
-            
-            // FIXED: 1-argument Exception Handlers matched
-            tdClient = Client.create({ update -> handleTdUpdate(update) }, { _ -> }, { _ -> })
+            // Set verbosity to 1 to catch internal C++ warnings/errors
+            Client.execute(TdApi.SetLogVerbosityLevel().apply { newVerbosityLevel = 1 })
+            tdClient = Client.create({ update -> handleTdUpdate(update) }, { e -> tdLog("JNI Exception: ${e.message}", "ERROR") }, { e -> tdLog("JNI Crash: ${e.message}", "ERROR") })
         }
     }
 
@@ -235,6 +268,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.Main) {
             when (update) {
                 is TdApi.UpdateAuthorizationState -> {
+                    tdLog("Auth State Shift: ${update.authorizationState.javaClass.simpleName}", "INFO")
                     when (update.authorizationState) {
                         is TdApi.AuthorizationStateWaitTdlibParameters -> {
                             val params = TdApi.SetTdlibParameters().apply {
@@ -248,7 +282,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                                 deviceModel = Build.MODEL
                                 applicationVersion = "1.0"
                             }
-                            tdClient?.send(params) { }
+                            sendTd(params)
                         }
                         is TdApi.AuthorizationStateWaitPhoneNumber -> tdAuthState = TdAuthState.WAIT_PHONE
                         is TdApi.AuthorizationStateWaitCode -> tdAuthState = TdAuthState.WAIT_CODE
@@ -256,10 +290,17 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                         is TdApi.AuthorizationStateReady -> {
                             tdAuthState = TdAuthState.READY
                             tgChatId = prefs.getLong("tdTargetChatId", 0L)
-                            if (tgChatId != 0L) fetchChatHistory()
+                            tdLog("Engine Authenticated. Target Chat ID: $tgChatId", "SUCCESS")
+                            if (tgChatId != 0L) fetchChatHistory() else tdLog("Target Chat ID is 0. Cannot fetch history.", "WARN")
                         }
                         is TdApi.AuthorizationStateClosed -> { tdAuthState = TdAuthState.CLOSED; isTdLibEngineRunning = false }
                     }
+                }
+                is TdApi.UpdateConnectionState -> {
+                    tdLog("Connection Matrix: ${update.state.javaClass.simpleName}", "INFO")
+                }
+                is TdApi.Error -> {
+                    tdLog("TDLib Internal Error: [${update.code}] ${update.message}", "ERROR")
                 }
                 is TdApi.UpdateNewMessage -> {
                     val msg = update.message
@@ -269,6 +310,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                             tgMessages.add(TgMessage(msg.id, content.text.text, msg.isOutgoing, msg.date * 1000L))
                             tgMessages.sortBy { it.timestamp }
                             saveLocalChatHistory()
+                            tdLog("Received Message: ${content.text.text}", "INFO")
                             if (!msg.isOutgoing) executeHardwareCommand(content.text.text)
                         }
                     }
@@ -277,21 +319,26 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // FIXED: Using .apply for all parameters to survive API changes
-    fun tdSendPhone(phone: String) = tdClient?.send(TdApi.SetAuthenticationPhoneNumber().apply { phoneNumber = phone }) { }
-    fun tdSendCode(code: String) = tdClient?.send(TdApi.CheckAuthenticationCode().apply { this.code = code }) { }
-    fun tdSendPassword(pass: String) = tdClient?.send(TdApi.CheckAuthenticationPassword().apply { password = pass }) { }
+    fun tdSendPhone(phone: String) { tdLog("Submitting Phone...", "INFO"); sendTd(TdApi.SetAuthenticationPhoneNumber().apply { phoneNumber = phone }) }
+    fun tdSendCode(code: String) { tdLog("Submitting OTP...", "INFO"); sendTd(TdApi.CheckAuthenticationCode().apply { this.code = code }) }
+    fun tdSendPassword(pass: String) { tdLog("Submitting 2FA...", "INFO"); sendTd(TdApi.CheckAuthenticationPassword().apply { password = pass }) }
 
     private fun fetchChatHistory() {
-        val chatReq = TdApi.GetChat().apply { chatId = tgChatId }
-        tdClient?.send(chatReq) { chat -> if (chat is TdApi.Chat) viewModelScope.launch(Dispatchers.Main) { tgChatName = chat.title } }
+        tdLog("Requesting Chat Data for ID: $tgChatId...", "INFO")
         
-        val historyReq = TdApi.GetChatHistory().apply {
-            chatId = tgChatId
-            limit = 50
+        // Attempt to load chat first to ensure it's in local DB
+        sendTd(TdApi.LoadChats().apply { chatList = null; limit = 100 })
+        
+        sendTd(TdApi.GetChat().apply { chatId = tgChatId }) { chat -> 
+            if (chat is TdApi.Chat) {
+                tdLog("Chat Identity Confirmed: ${chat.title}", "SUCCESS")
+                viewModelScope.launch(Dispatchers.Main) { tgChatName = chat.title } 
+            }
         }
-        tdClient?.send(historyReq) { res ->
+        
+        sendTd(TdApi.GetChatHistory().apply { chatId = tgChatId; limit = 50 }) { res ->
             if (res is TdApi.Messages) {
+                tdLog("History Extracted: ${res.messages.size} messages found.", "SUCCESS")
                 viewModelScope.launch(Dispatchers.Main) {
                     val newMsgs = res.messages.filter { it.content is TdApi.MessageText }.map { msg ->
                         TgMessage(msg.id, (msg.content as TdApi.MessageText).text.text, msg.isOutgoing, msg.date * 1000L)
@@ -305,38 +352,31 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun sendTelegramMessage(text: String, isMe: Boolean = true) {
-        if (tgChatId == 0L || tdClient == null) return
+        if (tgChatId == 0L || tdClient == null) {
+            tdLog("Cannot send message. Engine offline or Chat ID is 0.", "ERROR")
+            return
+        }
         
-        // Add to Local UI instantly
         viewModelScope.launch(Dispatchers.Main) {
             tgMessages.add(TgMessage(System.currentTimeMillis(), text, isMe, System.currentTimeMillis()))
             saveLocalChatHistory()
         }
 
-        // FIXED: Using .apply for nested message contents
         if (isMe) {
             viewModelScope.launch(Dispatchers.IO) {
-                val formattedText = TdApi.FormattedText().apply {
-                    this.text = text
-                    this.entities = emptyArray()
-                }
-                val inputContent = TdApi.InputMessageText().apply {
-                    this.text = formattedText
-                }
-                val request = TdApi.SendMessage().apply {
-                    this.chatId = tgChatId
-                    this.inputMessageContent = inputContent
-                }
-                tdClient?.send(request) { }
+                tdLog("Dispatching Payload...", "INFO")
+                val formattedText = TdApi.FormattedText().apply { this.text = text; this.entities = emptyArray() }
+                val inputContent = TdApi.InputMessageText().apply { this.text = formattedText }
+                val request = TdApi.SendMessage().apply { this.chatId = tgChatId; this.inputMessageContent = inputContent }
+                sendTd(request) { tdLog("Payload Sent Successfully.", "SUCCESS") }
             }
         }
     }
 
-    // --- Persistent Chat Methods ---
+    // --- Persistent Local UI ---
     private fun loadLocalChatHistory() {
-        val historyStr = prefs.getString("tg_history", "[]")
         try {
-            val arr = JSONArray(historyStr)
+            val arr = JSONArray(prefs.getString("tg_history", "[]"))
             tgMessages.clear()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
@@ -360,23 +400,20 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             when (cmd) {
                 "ping" -> {
-                    val batteryStatus = appCtx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-                    val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-                    sendTelegramMessage("🟢 Node Online.\n🔋 Battery: $level%")
+                    val bat = appCtx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                    sendTelegramMessage("🟢 Node Online.\n🔋 Battery: $bat%")
                 }
                 "loc" -> {
-                    sendTelegramMessage("🛰️ Fetching GPS Coordinates...")
+                    sendTelegramMessage("🛰️ Fetching GPS...")
                     try {
                         val loc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER) ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                        if (loc != null) sendTelegramMessage("📍 <b>Location Acquired:</b>\nLat: ${loc.latitude}\nLng: ${loc.longitude}\nAccuracy: ${loc.accuracy}m")
-                        else sendTelegramMessage("❌ Location unavailable.")
-                    } catch (e: Exception) { sendTelegramMessage("❌ GPS Error: ${e.message}") }
+                        if (loc != null) sendTelegramMessage("📍 <b>Location Acquired:</b>\nLat: ${loc.latitude}\nLng: ${loc.longitude}") else sendTelegramMessage("❌ Location unavailable.")
+                    } catch (e: Exception) { sendTelegramMessage("❌ GPS Error") }
                 }
                 "flash" -> {
                     try {
-                        val camId = cameraManager.cameraIdList[0]
                         val state = arg.lowercase() == "on"
-                        cameraManager.setTorchMode(camId, state)
+                        cameraManager.setTorchMode(cameraManager.cameraIdList[0], state)
                         sendTelegramMessage(if (state) "🔦 Flashlight Enabled" else "🔦 Flashlight Disabled")
                     } catch (e: Exception) { sendTelegramMessage("❌ Camera Hardware Error.") }
                 }
@@ -384,22 +421,15 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                     val targetVol = arg.toIntOrNull() ?: 50
                     val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
                     audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, (targetVol * max) / 100, 0)
-                    sendTelegramMessage("🔊 Media volume set to $targetVol%")
+                    sendTelegramMessage("🔊 Volume set to $targetVol%")
                 }
-                "live_start" -> {
-                    sendTelegramMessage("⚡ Initiating Live WebSocket Connection...")
-                    toggleServer(appCtx)
-                }
-                "live_stop" -> {
-                    ServerCore.ktorServer?.stop(1000, 2000)
-                    ServerCore.isRunning = false
-                    sendTelegramMessage("🛑 Core Node Terminated.")
-                }
+                "live_start" -> { sendTelegramMessage("⚡ Initiating Live WebSocket..."); toggleServer(appCtx) }
+                "live_stop" -> { ServerCore.ktorServer?.stop(1000, 2000); ServerCore.isRunning = false; sendTelegramMessage("🛑 Core Node Terminated.") }
             }
         }
     }
 
-    // --- Standard JSON & Ktor Configs below ---
+    // --- JSON Engine ---
     fun exportConfigToJson(): String {
         val root = JSONObject()
         root.put("network", JSONObject().put("ntfyUrl", prefs.getString("ntfyUrl", "https://ntfy.sh")).put("ntfyTopic", prefs.getString("ntfyTopic", "default_topic")))
@@ -430,7 +460,6 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     private fun loadConfigFromJson() {
         topPanelCommands.clear(); pushMessages.clear()
         val rawTp = prefs.getString("raw_top_panel", null); val rawCmds = prefs.getString("raw_commands", null)
-        
         if (rawTp != null && rawCmds != null) {
             try {
                 val tpArr = JSONArray(rawTp); for (i in 0 until tpArr.length()) { topPanelCommands.add(jsonToCmd(tpArr.getJSONObject(i))) }
@@ -441,7 +470,6 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
             topPanelCommands.add(PushMessage(2, "Ping Node", "ping", "", "radar"))
             topPanelCommands.add(PushMessage(3, "Location", "loc", "", "location_on"))
             topPanelCommands.add(PushMessage(4, "Volume", "vol", "100", "volume_up", true, "Mute", "vol", "0"))
-            
             pushMessages.add(PushMessage(10, "Wake/Live Node", "live_start", "ws://0.0.0.0:8765/live", "router"))
             pushMessages.add(PushMessage(11, "Kill Node", "live_stop", "", "power_settings_new"))
             pushMessages.add(PushMessage(12, "Cam Front", "cam_front", "", "camera_front"))
@@ -450,7 +478,6 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
             pushMessages.add(PushMessage(15, "Full Info", "info", "", "info"))
             pushMessages.add(PushMessage(16, "Fetch Logs", "get_log", "", "description"))
             pushMessages.add(PushMessage(17, "Clear Logs", "clear_log", "", "delete_sweep"))
-            
             exportConfigToJson().let { importConfigFromJson(it) }
         }
     }
@@ -586,9 +613,14 @@ fun MainScreen(viewModel: CoreViewModel) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun CommandsPager(viewModel: CoreViewModel) {
-    val pagerState = rememberPagerState(pageCount = { 2 })
+    // 3 Pages: 0 = Commands, 1 = Telegram Clone, 2 = TDLib Diagnostics
+    val pagerState = rememberPagerState(pageCount = { 3 })
     HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
-        if (page == 0) CommandsTab(viewModel) else TelegramCloneTab(viewModel)
+        when(page) {
+            0 -> CommandsTab(viewModel)
+            1 -> TelegramCloneTab(viewModel)
+            2 -> TdLibLogScreen(viewModel)
+        }
     }
 }
 
@@ -665,7 +697,6 @@ fun CommandsTab(viewModel: CoreViewModel) {
     }
 }
 
-// ---- Telegram TDLib Clone Tab ----
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TelegramCloneTab(viewModel: CoreViewModel) {
@@ -723,7 +754,7 @@ fun TelegramCloneTab(viewModel: CoreViewModel) {
                     Icon(Icons.Rounded.CloudOff, null, tint = TextSecondary, modifier = Modifier.size(64.dp))
                     Spacer(modifier = Modifier.height(16.dp))
                     Text("TDLib Engine Offline", color = TextSecondary, fontFamily = UbuntuFont)
-                    Text("Turn on using the power icon above.", color = TextSecondary, fontSize = 12.sp, fontFamily = UbuntuFont)
+                    Text("Swipe ⯈ to view Diagnostic Logs", color = TextSecondary, fontSize = 12.sp, fontFamily = UbuntuFont)
                 }
             }
         } else {
@@ -761,9 +792,35 @@ fun TelegramCloneTab(viewModel: CoreViewModel) {
             )
             Icon(Icons.Rounded.AttachFile, null, tint = TextSecondary, modifier = Modifier.padding(horizontal = 8.dp))
             if (inputTxt.isNotBlank()) {
-                IconButton(onClick = { viewModel.sendTelegramMessage(inputTxt); inputTxt = "" }) { Icon(Icons.Rounded.Send, null, tint = ActionBlue) }
+                IconButton(onClick = { viewModel.sendTelegramMessage(inputTxt, isMe = false); inputTxt = "" }) { Icon(Icons.Rounded.Send, null, tint = ActionBlue) }
             } else {
                 Icon(Icons.Rounded.Mic, null, tint = TextSecondary, modifier = Modifier.padding(horizontal = 8.dp))
+            }
+        }
+    }
+}
+
+@Composable
+fun TdLibLogScreen(viewModel: CoreViewModel) {
+    val context = LocalContext.current
+    val listState = rememberLazyListState()
+    LaunchedEffect(viewModel.tdLogs.size) { if(viewModel.tdLogs.isNotEmpty()) listState.animateScrollToItem(viewModel.tdLogs.size - 1) }
+
+    Column(modifier = Modifier.fillMaxSize().background(TgBackground)) {
+        Row(modifier = Modifier.fillMaxWidth().background(TgHeader).padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text("⯇ TDLib Diagnostic Engine", color = ActionBlue, fontFamily = UbuntuFont, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            IconButton(onClick = { viewModel.dumpTdLogs(context) }) { Icon(Icons.Rounded.SaveAlt, null, tint = SuccessGreen) }
+        }
+        
+        LazyColumn(state = listState, modifier = Modifier.weight(1f).padding(12.dp)) {
+            items(viewModel.tdLogs) { log ->
+                val color = when {
+                    log.contains("[ERROR]") -> PremiumRose
+                    log.contains("[SUCCESS]") -> SuccessGreen
+                    log.contains("[WARN]") -> PremiumTeal
+                    else -> TextSecondary
+                }
+                Text(log, color = color, fontSize = 11.sp, fontFamily = CyberFont, modifier = Modifier.padding(vertical = 2.dp))
             }
         }
     }
