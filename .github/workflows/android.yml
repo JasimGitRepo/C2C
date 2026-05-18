@@ -24,18 +24,19 @@ jobs:
           distribution: 'temurin'
 
       # =========================================================
-      # --- TDLIB OFFICIAL BASH COMPILATION & CACHING ---
+      # --- TDLIB OFFICIAL BASH COMPILATION & EXPLICIT CACHING ---
       # =========================================================
 
-      - name: Cache Official TDLib Build
-        id: cache-tdlib
-        uses: actions/cache@v4
+      # RESTORE: Check if the cache already exists at the start of the workflow
+      - name: Restore Official TDLib Build
+        id: cache-tdlib-restore
+        uses: actions/cache/restore@v4
         with:
           path: td-prebuilt
-          key: tdlib-official-bash-v1
+          key: tdlib-official-bash-v2
 
       - name: Set up Swap Space (Prevents OOM during NDK build)
-        if: steps.cache-tdlib.outputs.cache-hit != 'true'
+        if: steps.cache-tdlib-restore.outputs.cache-hit != 'true'
         run: |
           sudo dd if=/dev/zero of=/swapfile2 bs=1M count=8192
           sudo chmod 600 /swapfile2
@@ -43,13 +44,13 @@ jobs:
           sudo swapon /swapfile2
 
       - name: Install TDLib Build Dependencies
-        if: steps.cache-tdlib.outputs.cache-hit != 'true'
+        if: steps.cache-tdlib-restore.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y make git zlib1g-dev libssl-dev gperf php-cli cmake clang perl
 
       - name: Build Official TDLib via Telegram Bash Scripts
-        if: steps.cache-tdlib.outputs.cache-hit != 'true'
+        if: steps.cache-tdlib-restore.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/tdlib/td.git
           cd td/example/android
@@ -70,6 +71,15 @@ jobs:
           # The bash script drops the artifacts neatly into tdlib/libs and tdlib/java
           cp -R td/example/android/tdlib/libs/* td-prebuilt/libs/
           cp -R td/example/android/tdlib/java/* td-prebuilt/java/
+
+      # SAVE: Upload the cache IMMEDIATELY after compilation. 
+      # If the Android build fails later, this 1.5 hour work is still safely saved!
+      - name: Save Official TDLib Build to Cache
+        if: steps.cache-tdlib-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: td-prebuilt
+          key: tdlib-official-bash-v2
 
       # =========================================================
       # --- INJECT INTO ANDROID & BUILD APK ---

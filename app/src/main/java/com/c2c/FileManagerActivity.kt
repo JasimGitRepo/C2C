@@ -104,7 +104,7 @@ fun DualPaneFileManager() {
         )
 
         Column(modifier = Modifier.weight(1f).padding(horizontal = 16.dp, vertical = 8.dp)) {
-            GlassCard(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            FileExplorerGlassCard(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 Column {
                     Row(modifier = Modifier.fillMaxWidth().background(Color(0x22000000)).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = { val parent = File(localPath).parent; if (parent != null) localPath = parent }, modifier = Modifier.size(28.dp)) { Icon(Icons.Rounded.ArrowUpward, null, tint = ActionBlue) }
@@ -117,7 +117,7 @@ fun DualPaneFileManager() {
                 }
             }
             Spacer(modifier = Modifier.height(16.dp))
-            GlassCard(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            FileExplorerGlassCard(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 Column {
                     Row(modifier = Modifier.fillMaxWidth().background(Color(0x22000000)).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = { val segments = remotePath.trimEnd('/').split("/"); if (segments.size > 1) remotePath = segments.dropLast(1).joinToString("/") + "/" }, modifier = Modifier.size(28.dp)) { Icon(Icons.Rounded.ArrowUpward, null, tint = PremiumTeal) }
@@ -146,4 +146,13 @@ fun FileRow(file: FsItem, tint: Color, onClick: () -> Unit) {
             }
         }
     }
+}
+
+@Composable
+private fun FileExplorerGlassCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    Card(
+        modifier = modifier.border(1.dp, GlassBorder, PremiumShapes.medium),
+        colors = CardDefaults.cardColors(containerColor = GlassSurface),
+        shape = PremiumShapes.medium
+    ) { content() }
 }
