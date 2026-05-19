@@ -1,7 +1,7 @@
 package com.c2c
 
 import io.ktor.server.engine.ApplicationEngine
-import io.ktor.websocket.WebSocketServerSession
+import io.ktor.server.websocket.WebSocketServerSession
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.util.concurrent.CopyOnWriteArrayList
