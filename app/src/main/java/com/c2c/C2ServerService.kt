@@ -57,7 +57,7 @@ class C2ServerService : Service() {
         try {
             ServerCore.ktorServer = embeddedServer(io.ktor.server.cio.CIO, port = port, host = "0.0.0.0") {
                 install(WebSockets) {
-                    maxFrameSize = Long.MAX_VALUE // CRITICAL FIX: Allows massive frames without disconnecting
+                    maxFrameSize = Long.MAX_VALUE 
                     pingPeriod = Duration.ofSeconds(15)
                     timeout = Duration.ofSeconds(15)
                     masking = false

