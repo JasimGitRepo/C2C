@@ -11,11 +11,11 @@ data class CommandEntity(
     val cmd: String,
     val defaultArg: String,
     val icon: String,
-    val category: String, // New: For UI grouping
-    val isToggle: Boolean = false, // New: For toggle commands
-    val toggledLabel: String = "", // New: Label when toggled
-    val toggledCmd: String = "",   // New: Command when toggled
-    val toggledArg: String = ""    // New: Arg when toggled
+    val category: String, 
+    val isToggle: Boolean = false, 
+    val toggledLabel: String = "", 
+    val toggledCmd: String = "",   
+    val toggledArg: String = ""    
 )
 
 @Dao
@@ -23,14 +23,14 @@ interface CommandDao {
     @Query("SELECT * FROM commands ORDER BY category ASC, label ASC")
     fun getAllCommands(): Flow<List<CommandEntity>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE) // CRITICAL FIX: Handles updates for existing IDs
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertCommand(command: CommandEntity)
+
+    @Update // CRITICAL FIX: Explicit update to prevent duplication
+    suspend fun updateCommand(command: CommandEntity)
 
     @Delete
     suspend fun deleteCommand(command: CommandEntity)
-    
-    @Query("UPDATE commands SET defaultArg = :newArg WHERE id = :id")
-    suspend fun updateArg(id: Int, newArg: String)
 }
 
 @Database(entities = [CommandEntity::class], version = 1, exportSchema = false)

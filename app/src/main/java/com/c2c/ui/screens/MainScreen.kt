@@ -8,9 +8,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
@@ -31,6 +28,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -79,16 +77,20 @@ fun CommandHub(viewModel: CoreViewModel) {
     var showSettingsDialog by remember { mutableStateOf(false) }
     var commandToEdit by remember { mutableStateOf<CommandEntity?>(null) }
 
-    // CRITICAL FIX: Declare searchQuery BEFORE using it to filter
     var searchQuery by remember { mutableStateOf("") }
-    val filteredCommands = commands.filter { it.label.contains(searchQuery, ignoreCase = true) }
+    // Remove Quick and SoftKeys from the main grid entirely
+    val filteredCommands = commands.filter { 
+        it.label.contains(searchQuery, ignoreCase = true) && 
+        it.category != "Quick" && 
+        it.category != "SoftKey" 
+    }
 
     if (showAddDialog || commandToEdit != null) {
         CommandEditorDialog(
             command = commandToEdit,
             onDismiss = { showAddDialog = false; commandToEdit = null },
             onSave = { entity -> 
-                viewModel.addCommand(entity)
+                viewModel.saveCommand(entity) // Uses strict Insert/Update logic
                 showAddDialog = false; commandToEdit = null
             },
             onDelete = {
@@ -127,7 +129,7 @@ fun CommandHub(viewModel: CoreViewModel) {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // 2. Quick Actions Panel (Fully editable via Long Press)
+        // 2. Quick Actions Panel
         Row(
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(GlassSurface).padding(8.dp),
             horizontalArrangement = Arrangement.SpaceEvenly
@@ -136,7 +138,7 @@ fun CommandHub(viewModel: CoreViewModel) {
             quickCommands.forEach { cmd ->
                 val uiKey = "qa_${cmd.id}"
                 val isPending = pendingCommands.contains(uiKey)
-                val isToggled = viewModel.toggleStates[uiKey] ?: false
+                val isToggled by remember(cmd.id) { mutableStateOf(viewModel.toggleStates.getOrDefault(uiKey, false)) }
 
                 QuickActionButton(
                     icon = getIconByName(if (isToggled && cmd.isToggle) cmd.toggledIcon() else cmd.icon), 
@@ -154,7 +156,7 @@ fun CommandHub(viewModel: CoreViewModel) {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // 3. Modern Soft-Key Panel (Fully editable via Long Press)
+        // 3. Modern Soft-Key Panel
         Row(
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(50)).background(Color.Black).padding(vertical = 12.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
@@ -177,77 +179,51 @@ fun CommandHub(viewModel: CoreViewModel) {
         Text("Mission Directives", color = TextSecondary, fontSize = 12.sp, fontFamily = UbuntuFont)
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 4. Two-Column Dynamic Grid
-        val groupedCommands = filteredCommands.filter { it.category != "Quick" && it.category != "SoftKey" }.groupBy { it.category }
+        // 4. Two-Column Flawless Grid using Chunked Rows
+        val groupedCommands = filteredCommands.groupBy { it.category }
 
         LazyColumn(modifier = Modifier.weight(1f)) {
             groupedCommands.forEach { (category, categoryCommands) ->
                 stickyHeader {
-                    Text(category, style = MaterialTheme.typography.titleSmall, color = PremiumTeal, modifier = Modifier.fillMaxWidth().background(SoulBackground.copy(alpha = 0.95f)).padding(vertical = 4.dp))
+                    Text(
+                        text = category, 
+                        style = MaterialTheme.typography.titleSmall, 
+                        color = PremiumTeal, 
+                        modifier = Modifier.fillMaxWidth().background(SoulBackground.copy(alpha = 0.95f)).padding(vertical = 8.dp)
+                    )
                 }
-                item {
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(2),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        userScrollEnabled = false, 
-                        modifier = Modifier.heightIn(max = (categoryCommands.size * 70).dp + 100.dp) // Auto sizing logic for grids inside lists
+                
+                // CRITICAL FIX: Chunk items into rows to eliminate LazyVerticalGrid gap bugs
+                val chunkedRows = categoryCommands.chunked(2)
+                items(chunkedRows, key = { row -> row.joinToString { it.id.toString() } }) { rowCommands ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        items(categoryCommands, key = { it.id }) { cmd ->
+                        rowCommands.forEach { cmd ->
                             val uiKey = cmd.id.toString()
                             val isPending = pendingCommands.contains(uiKey)
-                            val isToggled = viewModel.toggleStates[uiKey] ?: false
+                            val isToggled by remember(cmd.id) { mutableStateOf(viewModel.toggleStates.getOrDefault(uiKey, false)) }
 
-                            Card(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(64.dp) 
-                                    .alpha(if (isPending) 0.5f else 1f)
-                                    .combinedClickable(
-                                        enabled = !isPending,
-                                        onClick = {
-                                            val actualCmd = if (isToggled && cmd.isToggle) cmd.toggledCmd else cmd.cmd
-                                            val actualArg = if (isToggled && cmd.isToggle) cmd.toggledArg else cmd.defaultArg
-                                            viewModel.enqueueCommand(actualCmd, actualArg, uiKey, isLive = false)
-                                            if (cmd.isToggle) viewModel.toggleStates[uiKey] = !isToggled
-                                        },
-                                        onLongClick = { commandToEdit = cmd }
-                                    ),
-                                colors = CardDefaults.cardColors(containerColor = GlassSurface),
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(12.dp).fillMaxSize(),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    if (isPending) {
-                                        CircularProgressIndicator(modifier = Modifier.size(20.dp), color = ActionBlue, strokeWidth = 2.dp)
-                                    } else {
-                                        Icon(getIconByName(if (isToggled && cmd.isToggle) cmd.toggledIcon() else cmd.icon), null, tint = ActionBlue, modifier = Modifier.size(20.dp))
-                                    }
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Column {
-                                        Text(
-                                            if (isToggled && cmd.isToggle) cmd.toggledLabel else cmd.label, 
-                                            color = TextPrimary, 
-                                            fontSize = 11.sp, 
-                                            fontWeight = FontWeight.Bold, 
-                                            maxLines = 1
-                                        )
-                                        if (cmd.defaultArg.isNotBlank() || (isToggled && cmd.toggledArg.isNotBlank())) {
-                                            Text(
-                                                if (isToggled && cmd.isToggle) cmd.toggledArg else cmd.defaultArg, 
-                                                color = PremiumTeal, 
-                                                fontSize = 9.sp, 
-                                                maxLines = 1
-                                            )
-                                        }
-                                    }
-                                }
-                            }
+                            CommandCard(
+                                cmd = cmd,
+                                isPending = isPending,
+                                isToggled = isToggled,
+                                modifier = Modifier.weight(1f),
+                                onClick = {
+                                    val actualCmd = if (isToggled && cmd.isToggle) cmd.toggledCmd else cmd.cmd
+                                    val actualArg = if (isToggled && cmd.isToggle) cmd.toggledArg else cmd.defaultArg
+                                    viewModel.enqueueCommand(actualCmd, actualArg, uiKey, isLive = false)
+                                    if (cmd.isToggle) viewModel.toggleStates[uiKey] = !isToggled
+                                },
+                                onLongClick = { commandToEdit = cmd }
+                            )
+                        }
+                        // Add an empty spacer to keep columns perfectly aligned if row has only 1 item
+                        if (rowCommands.size == 1) {
+                            Spacer(modifier = Modifier.weight(1f))
                         }
                     }
-                    Spacer(modifier = Modifier.height(16.dp))
                 }
             }
         }
@@ -255,6 +231,59 @@ fun CommandHub(viewModel: CoreViewModel) {
 
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomEnd) {
         FloatingActionButton(onClick = { showAddDialog = true }, modifier = Modifier.padding(24.dp), containerColor = ActionBlue) { Icon(Icons.Rounded.Add, null) }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun CommandCard(
+    cmd: CommandEntity,
+    isPending: Boolean,
+    isToggled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+) {
+    Card(
+        modifier = modifier
+            .height(64.dp)
+            .alpha(if (isPending) 0.5f else 1f)
+            .combinedClickable(
+                enabled = !isPending,
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
+        colors = CardDefaults.cardColors(containerColor = GlassSurface),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp).fillMaxSize(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (isPending) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), color = ActionBlue, strokeWidth = 2.dp)
+            } else {
+                Icon(getIconByName(if (isToggled && cmd.isToggle) cmd.toggledIcon() else cmd.icon), null, tint = ActionBlue, modifier = Modifier.size(20.dp))
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Column {
+                Text(
+                    text = if (isToggled && cmd.isToggle) cmd.toggledLabel else cmd.label, 
+                    color = TextPrimary, 
+                    fontSize = 11.sp, 
+                    fontWeight = FontWeight.Bold, 
+                    maxLines = 1
+                )
+                if (cmd.defaultArg.isNotBlank() || (isToggled && cmd.toggledArg.isNotBlank())) {
+                    Text(
+                        text = if (isToggled && cmd.isToggle) cmd.toggledArg else cmd.defaultArg, 
+                        color = PremiumTeal, 
+                        fontSize = 9.sp, 
+                        maxLines = 1
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -351,7 +380,9 @@ fun CommandEditorDialog(command: CommandEntity?, onDismiss: () -> Unit, onSave: 
                     TextButton(onClick = onDismiss) { Text("CANCEL", color = TextSecondary) }
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(onClick = { 
-                        val updatedCommand = (command ?: CommandEntity(id=0, label="", cmd="", defaultArg="", icon="", category="")).copy(
+                        // Preserve ID for update, or 0 for new insertion
+                        val updatedCommand = CommandEntity(
+                            id = command?.id ?: 0, 
                             label = label, cmd = cmd, defaultArg = arg, icon = icon, category = category,
                             isToggle = isToggle, toggledLabel = toggledLabel, toggledCmd = toggledCmd, toggledArg = toggledArg
                         )
@@ -561,6 +592,7 @@ fun LiveWebRtcHub(viewModel: CoreViewModel, eglContext: EglBase.Context) {
     }
 }
 
+// [TELEGRAM CLONE UI AND LOG UI REMAINS IDENTICAL TO PREVIOUS ITERATION...]
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TelegramCloneTab(viewModel: CoreViewModel) {
