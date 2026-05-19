@@ -28,7 +28,6 @@ import org.json.JSONObject
 import java.io.File
 
 data class FsItem(val name: String, val path: String, val isDir: Boolean, val size: Long = 0, val lastModified: Long = 0)
-data class TransferJob(val id: String, val fileName: String, var progress: Float, val isUpload: Boolean)
 
 class FileManagerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,21 +69,31 @@ fun DualPaneFileManager() {
     LaunchedEffect(remotePath, showHidden) {
         if (ServerCore.liveSessions.isNotEmpty()) {
             scope.launch(Dispatchers.IO) {
-                ServerCore.liveSessions.forEach { it.send(Frame.Text("""{"cmd":"fs_list","arg":"$remotePath"}""")) }
+                val payload = """{"cmd":"fm_ls","arg":"$remotePath"}"""
+                ServerCore.liveSessions.forEach { it.send(Frame.Text(payload)) }
             }
         }
     }
 
     LaunchedEffect(Unit) {
         ServerCore.logsFlow.collect { log ->
-            if (log.contains("RECV_JSON:") && log.contains("\"type\":\"fs_list\"")) {
+            if (log.contains("RECV:") && log.contains("\"cmd\":\"fm_ls_result\"")) {
                 try {
-                    val json = JSONObject(log.substringAfter("RECV_JSON: "))
-                    val array = json.getJSONArray("data")
+                    val jsonStr = log.substringAfter("RECV: ").trim()
+                    val json = JSONObject(jsonStr)
+                    val data = json.getJSONObject("data")
+                    val array = data.getJSONArray("files")
+                    
                     val list = mutableListOf<FsItem>()
                     for (i in 0 until array.length()) {
                         val obj = array.getJSONObject(i)
-                        list.add(FsItem(obj.getString("name"), obj.getString("path"), obj.getBoolean("isDir"), obj.optLong("size", 0), obj.optLong("modified", 0)))
+                        list.add(FsItem(
+                            obj.getString("name"), 
+                            if (remotePath.endsWith("/")) "$remotePath${obj.getString("name")}" else "$remotePath/${obj.getString("name")}", 
+                            obj.getBoolean("isDir"), 
+                            obj.optLong("size", 0), 
+                            obj.optLong("lastModified", 0)
+                        ))
                     }
                     remoteFiles = list.filter { showHidden || !it.name.startsWith(".") }.sortedWith(compareBy({ !it.isDir }, { it.name.lowercase() }))
                 } catch (e: Exception) {}
