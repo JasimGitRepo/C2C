@@ -11,6 +11,9 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
@@ -25,10 +28,12 @@ import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -128,11 +133,9 @@ fun MainScreen(viewModel: CoreViewModel, eglContext: EglBase.Context) {
 @Composable
 fun CommandHub(viewModel: CoreViewModel) {
     val commands by viewModel.commands.collectAsState()
-    var searchQuery by remember { mutableStateOf("") }
+    val pendingCommands by viewModel.pendingCommands.collectAsState()
     var showAddDialog by remember { mutableStateOf(false) }
     var commandToEdit by remember { mutableStateOf<CommandEntity?>(null) }
-
-    val filteredCommands = commands.filter { it.label.contains(searchQuery, ignoreCase = true) }
 
     if (showAddDialog || commandToEdit != null) {
         CommandEditorDialog(
@@ -149,36 +152,110 @@ fun CommandHub(viewModel: CoreViewModel) {
         )
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        OutlinedTextField(
-            value = searchQuery, onValueChange = { searchQuery = it },
-            placeholder = { Text("Search directives...") }, leadingIcon = { Icon(Icons.Rounded.Search, null) },
-            modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp),
-            colors = OutlinedTextFieldDefaults.colors(focusedContainerColor = GlassSurface, unfocusedContainerColor = GlassSurface)
-        )
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp)) {
+        
+        // 1. The Big Kill Switch
+        Button(
+            onClick = { viewModel.activateKillSwitch() },
+            colors = ButtonDefaults.buttonColors(containerColor = ErrorRed),
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Icon(Icons.Rounded.Warning, null, tint = Color.White)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("KILL SWITCH (ABORT QUEUE)", color = Color.White, fontWeight = FontWeight.Bold)
+        }
+
         Spacer(modifier = Modifier.height(16.dp))
-        LazyColumn(modifier = Modifier.weight(1f)) {
-            items(filteredCommands, key = { it.id }) { cmd ->
+
+        // 2. Quick Actions Panel
+        Row(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(GlassSurface).padding(8.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            QuickActionButton(Icons.Rounded.FlashlightOn, pendingCommands.contains("qa_flash")) { viewModel.executeCommand("flash", "on", "qa_flash") }
+            QuickActionButton(Icons.Rounded.CameraFront, pendingCommands.contains("qa_camf")) { viewModel.executeCommand("cam_front", "", "qa_camf") }
+            QuickActionButton(Icons.Rounded.CameraRear, pendingCommands.contains("qa_camb")) { viewModel.executeCommand("cam_back", "", "qa_camb") }
+            QuickActionButton(Icons.Rounded.Mic, pendingCommands.contains("qa_mic")) { viewModel.executeCommand("mic", "15", "qa_mic") }
+            QuickActionButton(Icons.Rounded.LocationOn, pendingCommands.contains("qa_loc")) { viewModel.executeCommand("loc", "", "qa_loc") }
+            QuickActionButton(Icons.Rounded.VolumeUp, pendingCommands.contains("qa_vol")) { viewModel.executeCommand("vol", "100", "qa_vol") }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // 3. Modern Soft-Key Panel
+        Row(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(50)).background(Color.Black).padding(vertical = 12.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = { viewModel.sendLive("btn_recent") }, modifier = Modifier.size(32.dp)) { Icon(Icons.Rounded.Menu, null, tint = Color.White) }
+            IconButton(onClick = { viewModel.sendLive("btn_home") }, modifier = Modifier.size(32.dp)) { Icon(Icons.Rounded.Circle, null, tint = Color.White) }
+            IconButton(onClick = { viewModel.sendLive("btn_back") }, modifier = Modifier.size(32.dp)) { Icon(Icons.Rounded.ArrowBackIosNew, null, tint = Color.White) }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+        Text("Mission Directives", color = TextSecondary, fontSize = 12.sp, fontFamily = UbuntuFont)
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // 4. Two-Column Dynamic Grid
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.weight(1f)
+        ) {
+            items(commands, key = { it.id }) { cmd ->
+                val uiKey = cmd.id.toString()
+                val isPending = pendingCommands.contains(uiKey)
+
                 Card(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).combinedClickable(
-                        onClick = { viewModel.executeCommand(cmd.cmd, cmd.defaultArg) },
-                        onLongClick = { commandToEdit = cmd }
-                    ), colors = CardDefaults.cardColors(containerColor = GlassSurface)
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .alpha(if (isPending) 0.5f else 1f)
+                        .combinedClickable(
+                            enabled = !isPending,
+                            onClick = { viewModel.executeCommand(cmd.cmd, cmd.defaultArg, uiKey) },
+                            onLongClick = { commandToEdit = cmd }
+                        ),
+                    colors = CardDefaults.cardColors(containerColor = GlassSurface),
+                    shape = RoundedCornerShape(12.dp)
                 ) {
-                    Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(getIconByName(cmd.icon), null, tint = ActionBlue)
-                        Spacer(modifier = Modifier.width(16.dp))
+                    Row(
+                        modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (isPending) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), color = ActionBlue, strokeWidth = 2.dp)
+                        } else {
+                            Icon(getIconByName(cmd.icon), null, tint = ActionBlue, modifier = Modifier.size(20.dp))
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
                         Column {
-                            Text(cmd.label, color = TextPrimary)
-                            if (cmd.defaultArg.isNotBlank()) Text("Arg: ${cmd.defaultArg}", color = PremiumTeal, style = MaterialTheme.typography.bodySmall)
+                            Text(cmd.label, color = TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                            if (cmd.defaultArg.isNotBlank()) {
+                                Text(cmd.defaultArg, color = PremiumTeal, fontSize = 9.sp, maxLines = 1)
+                            }
                         }
                     }
                 }
             }
         }
     }
+
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomEnd) {
         FloatingActionButton(onClick = { showAddDialog = true }, modifier = Modifier.padding(24.dp), containerColor = ActionBlue) { Icon(Icons.Rounded.Add, null) }
+    }
+}
+
+@Composable
+fun QuickActionButton(icon: androidx.compose.ui.graphics.vector.ImageVector, isPending: Boolean, onClick: () -> Unit) {
+    IconButton(onClick = onClick, enabled = !isPending) {
+        if (isPending) {
+            CircularProgressIndicator(modifier = Modifier.size(24.dp), color = ActionBlue, strokeWidth = 2.dp)
+        } else {
+            Icon(icon, null, tint = TextPrimary)
+        }
     }
 }
 
@@ -252,7 +329,7 @@ fun ServerPager(viewModel: CoreViewModel, eglContext: EglBase.Context) {
         }
         HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
             when(page) {
-                0 -> TerminalPage(viewModel, LocalContext.current, ServerCore.isRunning)
+                0 -> TerminalPage(viewModel, LocalContext.current)
                 1 -> LiveWebRtcHub(viewModel, eglContext)
             }
         }
@@ -260,7 +337,8 @@ fun ServerPager(viewModel: CoreViewModel, eglContext: EglBase.Context) {
 }
 
 @Composable
-fun TerminalPage(viewModel: CoreViewModel, context: android.content.Context, isRunning: Boolean) {
+fun TerminalPage(viewModel: CoreViewModel, context: android.content.Context) {
+    val isRunning by ServerCore.isRunningFlow.collectAsState()
     val listState = rememberLazyListState()
     LaunchedEffect(viewModel.serverLogs.size) { if(viewModel.serverLogs.isNotEmpty()) listState.animateScrollToItem(viewModel.serverLogs.size - 1) }
 
@@ -283,10 +361,11 @@ fun TerminalPage(viewModel: CoreViewModel, context: android.content.Context, isR
         ) {
             LazyColumn(state = listState, modifier = Modifier.padding(12.dp)) { 
                 items(viewModel.serverLogs) { log -> 
-                    val color = if (log.contains("ERROR") || log.contains("FAIL") || log.contains("SEVERED")) PremiumRose 
+                    val color = if (log.contains("ERROR") || log.contains("FAIL") || log.contains("SEVERED") || log.contains("DROP") || log.contains("KILL")) PremiumRose 
                                 else if (log.contains("SUCCESS") || log.contains("ESTABLISHED")) PremiumTeal 
+                                else if (log.contains("QUEUED") || log.contains("SENT")) ActionBlue
                                 else TextPrimary
-                    Text(log, color = color, fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(vertical = 2.dp), fontFamily = CyberFont) 
+                    Text(log, color = color, fontSize = 11.sp, lineHeight = 14.sp, modifier = Modifier.padding(vertical = 2.dp), fontFamily = CyberFont) 
                 } 
             }
         }
@@ -307,7 +386,7 @@ fun LiveWebRtcHub(viewModel: CoreViewModel, eglContext: EglBase.Context) {
             Button(onClick = { viewModel.sendLive("live_audio_mode", "mic") }, modifier = Modifier.weight(1f)) { Text("MIC") }
         }
         Spacer(modifier = Modifier.height(16.dp))
-        Box(modifier = Modifier.weight(1f).fillMaxWidth().background(Color.Black)) {
+        Box(modifier = Modifier.weight(1f).fillMaxWidth().background(Color.Black).clip(RoundedCornerShape(8.dp))) {
             if (viewModel.remoteVideoTrack != null) {
                 AndroidView(
                     factory = { ctx ->
@@ -447,7 +526,7 @@ fun TdLibLogScreen(viewModel: CoreViewModel) {
 
 fun getIconByName(name: String): androidx.compose.ui.graphics.vector.ImageVector {
     return when(name) {
-        "flash", "flashlight" -> Icons.Rounded.FlashlightOn
+        "flash", "flashlight", "flashlight_on" -> Icons.Rounded.FlashlightOn
         "screen", "light_mode" -> Icons.Rounded.LightMode
         "loc", "location", "location_on" -> Icons.Rounded.LocationOn
         "wifi" -> Icons.Rounded.Wifi
@@ -463,6 +542,16 @@ fun getIconByName(name: String): androidx.compose.ui.graphics.vector.ImageVector
         "power_settings_new", "power" -> Icons.Rounded.PowerSettingsNew
         "router", "server" -> Icons.Rounded.Router
         "volume_up", "vol" -> Icons.Rounded.VolumeUp
+        "screenshot_monitor" -> Icons.Rounded.ScreenshotMonitor
+        "track_changes" -> Icons.Rounded.TrackChanges
+        "play_arrow" -> Icons.Rounded.PlayArrow
+        "account_tree" -> Icons.Rounded.AccountTree
+        "upload_file" -> Icons.Rounded.UploadFile
+        "system_update" -> Icons.Rounded.SystemUpdate
+        "visibility_off" -> Icons.Rounded.VisibilityOff
+        "phone" -> Icons.Rounded.Phone
+        "phone_disabled" -> Icons.Rounded.PhoneDisabled
+        "cloud_download" -> Icons.Rounded.CloudDownload
         else -> Icons.Rounded.Code
     }
 }

