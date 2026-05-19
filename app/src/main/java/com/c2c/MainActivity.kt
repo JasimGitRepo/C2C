@@ -1,5 +1,6 @@
 package com.c2c
 
+import android.content.Context
 import android.os.Bundle
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
@@ -32,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -140,12 +142,20 @@ fun CommandHub(viewModel: CoreViewModel) {
     var showSettingsDialog by remember { mutableStateOf(false) }
     var commandToEdit by remember { mutableStateOf<CommandEntity?>(null) }
 
+    var searchQuery by remember { mutableStateOf("") }
+    
+    val filteredCommands = commands.filter { 
+        it.label.contains(searchQuery, ignoreCase = true) && 
+        it.category != "Quick" && 
+        it.category != "SoftKey" 
+    }
+
     if (showAddDialog || commandToEdit != null) {
         CommandEditorDialog(
             command = commandToEdit,
             onDismiss = { showAddDialog = false; commandToEdit = null },
             onSave = { entity -> 
-                viewModel.addCommand(entity)
+                viewModel.saveCommand(entity) // CRITICAL FIX: Changed from addCommand to saveCommand
                 showAddDialog = false; commandToEdit = null
             },
             onDelete = {
@@ -189,114 +199,92 @@ fun CommandHub(viewModel: CoreViewModel) {
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(GlassSurface).padding(8.dp),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            val quickCommands = commands.filter { it.category == "Quick" }.take(6) // Take top 6 quick commands
+            val quickCommands = commands.filter { it.category == "Quick" }.take(6) 
             quickCommands.forEach { cmd ->
                 val uiKey = "qa_${cmd.id}"
                 val isPending = pendingCommands.contains(uiKey)
                 val isToggled by remember(cmd.id) { mutableStateOf(viewModel.toggleStates.getOrDefault(uiKey, false)) }
 
                 QuickActionButton(
-                    icon = getIconByName(if (isToggled && cmd.isToggle) cmd.toggledIcon() else cmd.icon), // Use toggled icon if applicable
+                    icon = getIconByName(if (isToggled && cmd.isToggle) cmd.toggledIcon() else cmd.icon), 
                     isPending = isPending,
                     onClick = {
                         val actualCmd = if (isToggled && cmd.isToggle) cmd.toggledCmd else cmd.cmd
                         val actualArg = if (isToggled && cmd.isToggle) cmd.toggledArg else cmd.defaultArg
-                        viewModel.enqueueCommand(actualCmd, actualArg, uiKey)
+                        viewModel.enqueueCommand(actualCmd, actualArg, uiKey, isLive = false)
                         if (cmd.isToggle) viewModel.toggleStates[uiKey] = !isToggled
-                    }
+                    },
+                    onLongClick = { commandToEdit = cmd }
                 )
             }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // 3. Modern Soft-Key Panel (Live Commands - not queued via Ntfy)
+        // 3. Modern Soft-Key Panel
         Row(
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(50)).background(Color.Black).padding(vertical = 12.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            val recentKey = "live_btn_recent"
-            val homeKey = "live_btn_home"
-            val backKey = "live_btn_back"
-
-            SoftKeyButton(Icons.Rounded.Menu, pendingCommands.contains(recentKey)) { viewModel.enqueueCommand("btn_recent", "", recentKey, isLive = true) }
-            SoftKeyButton(Icons.Rounded.Circle, pendingCommands.contains(homeKey)) { viewModel.enqueueCommand("btn_home", "", homeKey, isLive = true) }
-            SoftKeyButton(Icons.Rounded.ArrowBackIosNew, pendingCommands.contains(backKey)) { viewModel.enqueueCommand("btn_back", "", backKey, isLive = true) }
+            val softKeyCommands = commands.filter { it.category == "SoftKey" }.take(3)
+            softKeyCommands.forEach { cmd ->
+                val uiKey = "sk_${cmd.id}"
+                val isPending = pendingCommands.contains(uiKey)
+                SoftKeyButton(
+                    icon = getIconByName(cmd.icon),
+                    isPending = isPending,
+                    onClick = { viewModel.enqueueCommand(cmd.cmd, cmd.defaultArg, uiKey, isLive = true) },
+                    onLongClick = { commandToEdit = cmd }
+                )
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
         Text("Mission Directives", color = TextSecondary, fontSize = 12.sp, fontFamily = UbuntuFont)
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 4. Two-Column Dynamic Grid
-        val groupedCommands = commands.filter { it.category != "Quick" }.groupBy { it.category }
+        // 4. Two-Column Flawless Grid using Chunked Rows
+        val groupedCommands = filteredCommands.groupBy { it.category }
 
         LazyColumn(modifier = Modifier.weight(1f)) {
             groupedCommands.forEach { (category, categoryCommands) ->
                 stickyHeader {
-                    Text(category, style = MaterialTheme.typography.titleSmall, color = PremiumTeal, modifier = Modifier.fillMaxWidth().background(SoulBackground.copy(alpha = 0.9f)).padding(vertical = 4.dp))
+                    Text(
+                        text = category, 
+                        style = MaterialTheme.typography.titleSmall, 
+                        color = PremiumTeal, 
+                        modifier = Modifier.fillMaxWidth().background(SoulBackground.copy(alpha = 0.95f)).padding(vertical = 8.dp)
+                    )
                 }
-                item {
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(2),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        userScrollEnabled = false, // Let LazyColumn handle overall scroll
-                        modifier = Modifier.heightIn(max = (categoryCommands.size * 70).dp) // Adjust max height per category
+                
+                val chunkedRows = categoryCommands.chunked(2)
+                items(chunkedRows, key = { row -> row.joinToString { it.id.toString() } }) { rowCommands ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        items(categoryCommands, key = { it.id }) { cmd ->
+                        rowCommands.forEach { cmd ->
                             val uiKey = cmd.id.toString()
                             val isPending = pendingCommands.contains(uiKey)
                             val isToggled by remember(cmd.id) { mutableStateOf(viewModel.toggleStates.getOrDefault(uiKey, false)) }
 
-                            Card(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(70.dp) // Fixed height for grid items
-                                    .alpha(if (isPending) 0.5f else 1f)
-                                    .combinedClickable(
-                                        enabled = !isPending,
-                                        onClick = {
-                                            val actualCmd = if (isToggled && cmd.isToggle) cmd.toggledCmd else cmd.cmd
-                                            val actualArg = if (isToggled && cmd.isToggle) cmd.toggledArg else cmd.defaultArg
-                                            viewModel.enqueueCommand(actualCmd, actualArg, uiKey)
-                                            if (cmd.isToggle) viewModel.toggleStates[uiKey] = !isToggled
-                                        },
-                                        onLongClick = { commandToEdit = cmd }
-                                    ),
-                                colors = CardDefaults.cardColors(containerColor = GlassSurface),
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(12.dp).fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    if (isPending) {
-                                        CircularProgressIndicator(modifier = Modifier.size(20.dp), color = ActionBlue, strokeWidth = 2.dp)
-                                    } else {
-                                        Icon(getIconByName(cmd.icon), null, tint = ActionBlue, modifier = Modifier.size(20.dp))
-                                    }
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Column {
-                                        Text(
-                                            if (isToggled && cmd.isToggle) cmd.toggledLabel else cmd.label, 
-                                            color = TextPrimary, 
-                                            fontSize = 11.sp, 
-                                            fontWeight = FontWeight.Bold, 
-                                            maxLines = 1
-                                        )
-                                        if (cmd.defaultArg.isNotBlank() || (isToggled && cmd.toggledArg.isNotBlank())) {
-                                            Text(
-                                                if (isToggled && cmd.isToggle) cmd.toggledArg else cmd.defaultArg, 
-                                                color = PremiumTeal, 
-                                                fontSize = 9.sp, 
-                                                maxLines = 1
-                                            )
-                                        }
-                                    }
-                                }
-                            }
+                            CommandCard(
+                                cmd = cmd,
+                                isPending = isPending,
+                                isToggled = isToggled,
+                                modifier = Modifier.weight(1f),
+                                onClick = {
+                                    val actualCmd = if (isToggled && cmd.isToggle) cmd.toggledCmd else cmd.cmd
+                                    val actualArg = if (isToggled && cmd.isToggle) cmd.toggledArg else cmd.defaultArg
+                                    viewModel.enqueueCommand(actualCmd, actualArg, uiKey, isLive = false)
+                                    if (cmd.isToggle) viewModel.toggleStates[uiKey] = !isToggled
+                                },
+                                onLongClick = { commandToEdit = cmd }
+                            )
+                        }
+                        if (rowCommands.size == 1) {
+                            Spacer(modifier = Modifier.weight(1f))
                         }
                     }
                 }
@@ -309,9 +297,73 @@ fun CommandHub(viewModel: CoreViewModel) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun QuickActionButton(icon: androidx.compose.ui.graphics.vector.ImageVector, isPending: Boolean, onClick: () -> Unit) {
-    IconButton(onClick = onClick, enabled = !isPending) {
+fun CommandCard(
+    cmd: CommandEntity,
+    isPending: Boolean,
+    isToggled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+) {
+    Card(
+        modifier = modifier
+            .height(64.dp)
+            .alpha(if (isPending) 0.5f else 1f)
+            .combinedClickable(
+                enabled = !isPending,
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
+        colors = CardDefaults.cardColors(containerColor = GlassSurface),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp).fillMaxSize(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (isPending) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), color = ActionBlue, strokeWidth = 2.dp)
+            } else {
+                Icon(getIconByName(if (isToggled && cmd.isToggle) cmd.toggledIcon() else cmd.icon), null, tint = ActionBlue, modifier = Modifier.size(20.dp))
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Column {
+                Text(
+                    text = if (isToggled && cmd.isToggle) cmd.toggledLabel else cmd.label, 
+                    color = TextPrimary, 
+                    fontSize = 11.sp, 
+                    fontWeight = FontWeight.Bold, 
+                    maxLines = 1
+                )
+                if (cmd.defaultArg.isNotBlank() || (isToggled && cmd.toggledArg.isNotBlank())) {
+                    Text(
+                        text = if (isToggled && cmd.isToggle) cmd.toggledArg else cmd.defaultArg, 
+                        color = PremiumTeal, 
+                        fontSize = 9.sp, 
+                        maxLines = 1
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun QuickActionButton(icon: ImageVector, isPending: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(48.dp)
+            .alpha(if (isPending) 0.5f else 1f)
+            .combinedClickable(
+                enabled = !isPending,
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
+        contentAlignment = Alignment.Center
+    ) {
         if (isPending) {
             CircularProgressIndicator(modifier = Modifier.size(24.dp), color = ActionBlue, strokeWidth = 2.dp)
         } else {
@@ -320,10 +372,25 @@ fun QuickActionButton(icon: androidx.compose.ui.graphics.vector.ImageVector, isP
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun SoftKeyButton(icon: androidx.compose.ui.graphics.vector.ImageVector, isPending: Boolean, onClick: () -> Unit) {
-    IconButton(onClick = onClick, enabled = !isPending, modifier = Modifier.alpha(if (isPending) 0.5f else 1f)) {
-        Icon(icon, null, tint = Color.White)
+fun SoftKeyButton(icon: ImageVector, isPending: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(48.dp)
+            .alpha(if (isPending) 0.5f else 1f)
+            .combinedClickable(
+                enabled = !isPending,
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        if (isPending) {
+            CircularProgressIndicator(modifier = Modifier.size(24.dp), color = ActionBlue, strokeWidth = 2.dp)
+        } else {
+            Icon(icon, null, tint = Color.White)
+        }
     }
 }
 
@@ -376,7 +443,8 @@ fun CommandEditorDialog(command: CommandEntity?, onDismiss: () -> Unit, onSave: 
                     TextButton(onClick = onDismiss) { Text("CANCEL", color = TextSecondary) }
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(onClick = { 
-                        val updatedCommand = (command ?: CommandEntity(id=0, label="", cmd="", defaultArg="", icon="", category="")).copy(
+                        val updatedCommand = CommandEntity(
+                            id = command?.id ?: 0, 
                             label = label, cmd = cmd, defaultArg = arg, icon = icon, category = category,
                             isToggle = isToggle, toggledLabel = toggledLabel, toggledCmd = toggledCmd, toggledArg = toggledArg
                         )
@@ -484,15 +552,16 @@ fun ServerPager(viewModel: CoreViewModel, eglContext: EglBase.Context) {
 }
 
 @Composable
-fun TerminalPage(viewModel: CoreViewModel, context: android.content.Context) {
+fun TerminalPage(viewModel: CoreViewModel, context: Context) {
     val isRunning by ServerCore.isRunningFlow.collectAsState()
     val listState = rememberLazyListState()
     LaunchedEffect(viewModel.serverLogs.size) { if(viewModel.serverLogs.isNotEmpty()) listState.animateScrollToItem(viewModel.serverLogs.size - 1) }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        val btnColor = if (isRunning) ErrorRed else ActionBlue
         Button(
             onClick = { viewModel.toggleServer(context) },
-            colors = ButtonDefaults.buttonColors(containerColor = if (isRunning) PremiumRose else ActionBlue),
+            colors = ButtonDefaults.buttonColors(containerColor = btnColor),
             modifier = Modifier.height(56.dp).fillMaxWidth()
         ) {
             Text(if (isRunning) "TERMINATE NODE" else "INITIALIZE NODE")
@@ -509,7 +578,7 @@ fun TerminalPage(viewModel: CoreViewModel, context: android.content.Context) {
             LazyColumn(state = listState, modifier = Modifier.padding(12.dp)) { 
                 items(viewModel.serverLogs) { log -> 
                     val color = if (log.contains("ERROR") || log.contains("FAIL") || log.contains("SEVERED") || log.contains("DROP") || log.contains("KILL")) PremiumRose 
-                                else if (log.contains("SUCCESS") || log.contains("ESTABLISHED")) PremiumTeal 
+                                else if (log.contains("SUCCESS") || log.contains("ESTABLISHED") || log.contains("STARTED")) PremiumTeal 
                                 else if (log.contains("QUEUED") || log.contains("SENT")) ActionBlue
                                 else TextPrimary
                     Text(log, color = color, fontSize = 11.sp, lineHeight = 14.sp, modifier = Modifier.padding(vertical = 2.dp), fontFamily = CyberFont) 
@@ -535,7 +604,7 @@ fun LiveWebRtcHub(viewModel: CoreViewModel, eglContext: EglBase.Context) {
                 onClick = { viewModel.terminateWebRtcConnection() }, 
                 modifier = Modifier.weight(1f), 
                 colors = ButtonDefaults.buttonColors(containerColor = ErrorRed)
-            ) { Text("STOP") }
+            ) { Text("STOP ALL") }
         }
         Spacer(modifier = Modifier.height(16.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -578,13 +647,14 @@ fun LiveWebRtcHub(viewModel: CoreViewModel, eglContext: EglBase.Context) {
         }
         Spacer(modifier = Modifier.height(16.dp))
         Button(
-            onClick = { viewModel.activateKillSwitch() }, // Kill switch also applies to live commands
+            onClick = { viewModel.activateKillSwitch() }, 
             colors = ButtonDefaults.buttonColors(containerColor = ErrorRed),
             modifier = Modifier.fillMaxWidth()
         ) { Text("RELEASE LIVE LOCKS") }
     }
 }
 
+// [TELEGRAM CLONE UI AND LOG UI REMAINS IDENTICAL TO PREVIOUS ITERATION...]
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TelegramCloneTab(viewModel: CoreViewModel) {
@@ -706,27 +776,27 @@ fun TdLibLogScreen(viewModel: CoreViewModel) {
 
 fun CommandEntity.toggledIcon(): String {
     return when(this.cmd) {
-        "flash" -> "flashlight_off" // Custom icon for flash off
-        "vol" -> "volume_off" // Custom icon for volume mute
-        "icon_hide" -> "visibility" // Custom icon for show icon
-        "toggle_wifi" -> "wifi_off" // Custom icon for wifi off
-        "toggle_hotspot" -> "hotspot_off" // Custom icon for hotspot off
-        "call" -> "phone_disabled" // Custom icon for end call
-        "halt_workflow" -> "play_arrow" // Custom icon for resume workflow
-        else -> this.icon // Fallback to default icon
+        "flash" -> "flashlight_off" 
+        "vol" -> "volume_off" 
+        "icon_hide" -> "visibility" 
+        "toggle_wifi" -> "wifi_off" 
+        "toggle_hotspot" -> "hotspot_off" 
+        "call" -> "phone_disabled" 
+        "halt_workflow" -> "play_arrow" 
+        else -> this.icon 
     }
 }
 
-fun getIconByName(name: String): androidx.compose.ui.graphics.vector.ImageVector {
+fun getIconByName(name: String): ImageVector {
     return when(name) {
         "flash", "flashlight", "flashlight_on" -> Icons.Rounded.FlashlightOn
-        "flashlight_off" -> Icons.Rounded.FlashlightOff // New icon
+        "flashlight_off" -> Icons.Rounded.FlashlightOff 
         "screen", "light_mode" -> Icons.Rounded.LightMode
         "loc", "location", "location_on" -> Icons.Rounded.LocationOn
         "wifi" -> Icons.Rounded.Wifi
-        "wifi_off" -> Icons.Rounded.WifiOff // New icon
+        "wifi_off" -> Icons.Rounded.WifiOff 
         "bluetooth" -> Icons.Rounded.Bluetooth
-        "hotspot_off" -> Icons.Rounded.WifiOff // Using WifiOff for HotspotOff
+        "hotspot_off" -> Icons.Rounded.WifiOff 
         "folder" -> Icons.Rounded.FolderOpen
         "radar" -> Icons.Rounded.Radar
         "camera_front" -> Icons.Rounded.CameraFront
@@ -738,7 +808,7 @@ fun getIconByName(name: String): androidx.compose.ui.graphics.vector.ImageVector
         "power_settings_new", "power" -> Icons.Rounded.PowerSettingsNew
         "router", "server" -> Icons.Rounded.Router
         "volume_up", "vol" -> Icons.Rounded.VolumeUp
-        "volume_off" -> Icons.Rounded.VolumeOff // New icon
+        "volume_off" -> Icons.Rounded.VolumeOff 
         "screenshot_monitor" -> Icons.Rounded.ScreenshotMonitor
         "track_changes" -> Icons.Rounded.TrackChanges
         "play_arrow" -> Icons.Rounded.PlayArrow
@@ -746,15 +816,15 @@ fun getIconByName(name: String): androidx.compose.ui.graphics.vector.ImageVector
         "upload_file" -> Icons.Rounded.UploadFile
         "system_update" -> Icons.Rounded.SystemUpdate
         "visibility_off" -> Icons.Rounded.VisibilityOff
-        "visibility" -> Icons.Rounded.Visibility // New icon
+        "visibility" -> Icons.Rounded.Visibility 
         "phone" -> Icons.Rounded.Phone
         "phone_disabled" -> Icons.Rounded.PhoneDisabled
         "cloud_download" -> Icons.Rounded.CloudDownload
-        "network_wifi" -> Icons.Rounded.NetworkWifi // New icon
-        "stop" -> Icons.Rounded.Stop // New icon for workflow halt
-        "menu" -> Icons.Rounded.Menu // For recent apps soft key
-        "circle" -> Icons.Rounded.Circle // For home soft key
-        "arrow_back_ios_new" -> Icons.Rounded.ArrowBackIosNew // For back soft key
+        "network_wifi" -> Icons.Rounded.NetworkWifi 
+        "stop" -> Icons.Rounded.Stop 
+        "menu" -> Icons.Rounded.Menu 
+        "circle" -> Icons.Rounded.Circle 
+        "arrow_back_ios_new" -> Icons.Rounded.ArrowBackIosNew 
         else -> Icons.Rounded.Code
     }
 }
