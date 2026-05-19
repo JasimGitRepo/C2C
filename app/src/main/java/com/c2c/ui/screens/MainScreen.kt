@@ -31,7 +31,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -80,8 +79,9 @@ fun CommandHub(viewModel: CoreViewModel) {
     var showSettingsDialog by remember { mutableStateOf(false) }
     var commandToEdit by remember { mutableStateOf<CommandEntity?>(null) }
 
-    val filteredCommands = commands.filter { it.label.contains(searchQuery, ignoreCase = true) }
+    // CRITICAL FIX: Declare searchQuery BEFORE using it to filter
     var searchQuery by remember { mutableStateOf("") }
+    val filteredCommands = commands.filter { it.label.contains(searchQuery, ignoreCase = true) }
 
     if (showAddDialog || commandToEdit != null) {
         CommandEditorDialog(
@@ -178,7 +178,7 @@ fun CommandHub(viewModel: CoreViewModel) {
         Spacer(modifier = Modifier.height(8.dp))
 
         // 4. Two-Column Dynamic Grid
-        val groupedCommands = commands.filter { it.category != "Quick" && it.category != "SoftKey" }.groupBy { it.category }
+        val groupedCommands = filteredCommands.filter { it.category != "Quick" && it.category != "SoftKey" }.groupBy { it.category }
 
         LazyColumn(modifier = Modifier.weight(1f)) {
             groupedCommands.forEach { (category, categoryCommands) ->
@@ -294,7 +294,11 @@ fun SoftKeyButton(icon: ImageVector, isPending: Boolean, onClick: () -> Unit, on
             ),
         contentAlignment = Alignment.Center
     ) {
-        Icon(icon, null, tint = Color.White)
+        if (isPending) {
+            CircularProgressIndicator(modifier = Modifier.size(24.dp), color = ActionBlue, strokeWidth = 2.dp)
+        } else {
+            Icon(icon, null, tint = Color.White)
+        }
     }
 }
 
@@ -383,7 +387,7 @@ fun CoreSettingsDialog(viewModel: CoreViewModel, onDismiss: () -> Unit) {
                 if (selectedTab == 0) {
                     OutlinedTextField(value = settings.ntfyUrl, onValueChange = { settings = settings.copy(ntfyUrl = it) }, label = { Text("Ntfy URL") }, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(value = settings.ntfyTopic, onValueChange = { settings = settings.copy(ntfyTopic = it) }, label = { Text("Ntfy Topic") }, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = settings.serverIp, onValueChange = { settings = settings.copy(serverIp = it) }, label = { Text("Server IP") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = settings.serverIp, onValueChange = { settings = settings.copy(serverIp = it) }, label = { Text("Server IP (for Ktor bind)") }, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(value = settings.port, onValueChange = { settings = settings.copy(port = it) }, label = { Text("Server Port") }, modifier = Modifier.fillMaxWidth())
                 } else {
                     OutlinedTextField(value = settings.apiId, onValueChange = { settings = settings.copy(apiId = it) }, label = { Text("API ID") }, modifier = Modifier.fillMaxWidth())
@@ -689,7 +693,7 @@ fun CommandEntity.toggledIcon(): String {
     }
 }
 
-fun getIconByName(name: String): androidx.compose.ui.graphics.vector.ImageVector {
+fun getIconByName(name: String): ImageVector {
     return when(name) {
         "flash", "flashlight", "flashlight_on" -> Icons.Rounded.FlashlightOn
         "flashlight_off" -> Icons.Rounded.FlashlightOff 
